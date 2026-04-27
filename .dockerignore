@@ -1,0 +1,29 @@
+# Version control
+.git/
+.gitignore
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# CI / docs
+.github/
+*.md
+LICENSE
+CHANGELOG.md
+
+# Build artifacts
+bin/
+coverage.*
+*.out
+*.test
+
+# Local config
+.env
+.actrc
+.claude/
+.aidlc-rule-details/
+aidlc-docs/
+validation_local/

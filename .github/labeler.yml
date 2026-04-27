@@ -1,0 +1,42 @@
+# Labeler configuration for automatic PR labelling.
+# Documentation: https://github.com/actions/labeler
+
+# ─── Source code ────────────────────────────────────────────────────────────
+go:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "cmd/**/*.go"
+          - "internal/**/*.go"
+          - "go.mod"
+          - "go.sum"
+
+# ─── Docker ──────────────────────────────────────────────────────────────────
+docker:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "Dockerfile"
+          - ".dockerignore"
+
+# ─── CI/CD ───────────────────────────────────────────────────────────────────
+ci:
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".github/workflows/**"
+          - ".github/dependabot.yml"
+          - "release-please-config.json"
+          - ".release-please-manifest.json"
+
+# ─── Documentation ───────────────────────────────────────────────────────────
+documentation:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "README.md"
+          - "CHANGELOG.md"
+          - "docs/**"
+
+# ─── GitHub templates & settings ─────────────────────────────────────────────
+github:
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".github/**"
+          - ".gitignore"

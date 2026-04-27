@@ -1,0 +1,50 @@
+---
+version: 2
+
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "03:00"
+    groups:
+      golang-minor-patch:
+        update-types:
+          - minor
+          - patch
+      golang-major:
+        update-types:
+          - major
+    open-pull-requests-limit: 5
+    rebase-strategy: auto
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "03:00"
+    groups:
+      docker-dependencies:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 5
+    rebase-strategy: auto
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "03:00"
+    groups:
+      actions-minor-patch:
+        update-types:
+          - minor
+          - patch
+      actions-major:
+        update-types:
+          - major
+    open-pull-requests-limit: 5
+    rebase-strategy: auto

@@ -1,0 +1,40 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+
+# Test binary, built with `go test -c`
+*.test
+
+# Code coverage profiles and other test artifacts
+*.out
+coverage.*
+*.coverprofile
+profile.cov
+
+# Go workspace file
+go.work
+go.work.sum
+
+# Dependency directories
+# vendor/
+
+# Environment
+.env
+
+# Editor / IDE
+.idea/
+.vscode/
+
+# AIDLC
+.aidlc-rule-details/
+aidlc-docs/
+
+# Claude Code
+.claude/
+
+# Local validation
+validation_local/

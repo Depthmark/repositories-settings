@@ -1,0 +1,41 @@
+---
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag (e.g., v1.0.0). Use to retry a failed release."
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # Gate: run full CI before releasing.
+  # ─────────────────────────────────────────────────────────────────────────
+  ci:
+    name: CI Gate
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Build and push Docker image to GHCR.
+  # ─────────────────────────────────────────────────────────────────────────
+  docker:
+    needs: [ci]
+    uses: Depthmark/reusable-workflows/.github/workflows/docker-build-push.yml@b75184a59af82875f02abd547e57645ffcdcd91a # v1.0.1
+    with:
+      tag_name: ${{ inputs.tag_name || github.ref_name }}
+      sign: true
+      attest: false
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write

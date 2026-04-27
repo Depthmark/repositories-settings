@@ -1,0 +1,27 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "separate-pull-requests": true,
+  "packages": {
+    ".": {
+      "release-type": "go",
+      "package-name": "template-go",
+      "component": "template-go",
+      "include-component-in-tag": false,
+      "changelog-type": "default",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "draft": false,
+      "prerelease": false,
+      "extra-files": [
+        "Dockerfile"
+      ],
+      "include-paths": [
+        "*.go",
+        "cmd",
+        "internal",
+        "go.mod",
+        "go.sum"
+      ]
+    }
+  }
+}
