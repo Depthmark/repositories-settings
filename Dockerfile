@@ -23,7 +23,7 @@ ARG TARGETARCH=amd64
 RUN --mount=type=cache,target=/go/pkg/mod,sharing=locked \
     --mount=type=cache,target=/root/.cache/go-build,sharing=locked \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags="-s -w" -o /template-go ./cmd/template-go
+    go build -trimpath -ldflags="-s -w" -o /repo-settings ./cmd/repo-settings
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 2: Runtime
@@ -32,15 +32,15 @@ RUN --mount=type=cache,target=/go/pkg/mod,sharing=locked \
 FROM gcr.io/distroless/static-debian12:nonroot
 
 LABEL maintainer="Alexandre Delisle <oss@adelisle.com>"
-LABEL description="template-go — Depthmark Go service template"
+LABEL description="repo-settings — declarative GitHub repository configuration-as-code"
 # x-release-please-start-version
 LABEL version="0.1.1"
 # x-release-please-end
 
-COPY --from=builder /template-go /template-go
+COPY --from=builder /repo-settings /repo-settings
 
 EXPOSE 8080
 
 USER nonroot:nonroot
 
-ENTRYPOINT ["/template-go"]
+ENTRYPOINT ["/repo-settings"]

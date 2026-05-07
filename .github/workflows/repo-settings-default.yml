@@ -1,0 +1,66 @@
+---
+# Opinionated wrapper around repo-settings.yml with org-baked defaults.
+# Consumer repos call THIS instead of the low-level workflow so they
+# don't each have to memorize api-url / sts-url / sts-app / etc.
+#
+# Lives alongside repo-settings.yml in this repo at:
+#   .github/workflows/repo-settings-default.yml
+#
+# Consumer usage (.github/workflows/repo-settings.yml in any target repo):
+#
+#   name: repo-settings
+#   on:
+#     push: { branches: [main], paths: ['.github/settings/**'] }
+#     pull_request: { paths: ['.github/settings/**'] }
+#   permissions:
+#     contents: read
+#     checks: write
+#     id-token: write
+#   jobs:
+#     settings:
+#       uses: Depthmark/repository-settings/.github/workflows/repo-settings-default.yml@main
+#       with:
+#         api-url: https://repository-settings.example.com
+#         sts-url: https://github-sts.example.com
+#       secrets: inherit
+#
+# If a repo needs to override any of the baked defaults (e.g. staging
+# API URL), call repo-settings.yml directly instead.
+
+name: repo-settings (default)
+
+on:
+  workflow_call:
+    inputs:
+      api-url:
+        description: "repo-settings service URL"
+        required: true
+        type: string
+      sts-url:
+        description: "STS service URL"
+        required: true
+        type: string
+    secrets:
+      api-secret:
+        description: "Optional fallback shared secret. Omit when using STS."
+        required: false
+
+permissions: {}
+
+jobs:
+  settings:
+    uses: ./.github/workflows/repo-settings.yml
+    permissions:
+      contents: read
+      checks: write
+      id-token: write
+    with:
+      api-url: ${{ inputs.api-url }}
+      auth-method: sts
+      sts-url: ${{ inputs.sts-url }}
+      sts-app: depthmark-repo-settings
+      sts-identity: repo-settings
+    secrets:
+      # Explicit forwarding — narrower than `secrets: inherit` and
+      # passes only what the called workflow actually declares.
+      api-secret: ${{ secrets.api-secret }}

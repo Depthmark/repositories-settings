@@ -1,0 +1,253 @@
+---
+# Low-level reusable workflow for repo-settings.
+#
+# Most consumers should use repo-settings-default.yml (same directory),
+# which wraps this one with org-baked defaults. Call THIS workflow
+# directly only when you need to override something the wrapper hardcodes.
+#
+#   name: repo-settings
+#   on:
+#     push:
+#       branches: [main]
+#       paths: ['.github/settings/**']
+#     pull_request:
+#       paths: ['.github/settings/**']
+#   permissions:
+#     contents: read
+#     checks: write
+#     id-token: write
+#   jobs:
+#     settings:
+#       uses: Depthmark/repository-settings/.github/workflows/repo-settings.yml@main
+#       with:
+#         auth-method: sts              # or "github-app"
+#         # STS options (if auth-method: sts)
+#         sts-url: https://github-sts.example.com
+#         sts-app: depthmark-release-bot
+#         sts-identity: repo-settings
+#       secrets:
+#         api-secret: ${{ secrets.REPO_SETTINGS_API_SECRET }}
+
+name: repo-settings
+
+on:
+  workflow_call:
+    inputs:
+      api-url:
+        description: "repo-settings service URL"
+        required: false
+        type: string
+        default: "https://repo-settings.internal"
+      auth-method:
+        description: "Authentication method: 'sts' or 'github-app'"
+        required: false
+        type: string
+        default: "sts"
+      sts-url:
+        description: "STS service URL (required if auth-method is sts)"
+        required: false
+        type: string
+        default: ""
+      sts-app:
+        description: "STS app name (required if auth-method is sts)"
+        required: false
+        type: string
+        default: ""
+      sts-identity:
+        description: "STS identity (required if auth-method is sts)"
+        required: false
+        type: string
+        default: "repo-settings"
+    secrets:
+      api-secret:
+        description: "Shared API secret (required if auth-method is github-app, or as fallback)"
+        required: false
+
+permissions: {}
+
+jobs:
+  settings:
+    name: repo-settings
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+      checks: write
+      id-token: write   # Required for STS OIDC token
+    steps:
+      # --- Pre-flight: validate YAML schemas ---
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Validate settings schemas
+        env:
+          API_URL: ${{ inputs.api-url }}
+        run: |
+          # Collect all .github/settings/*.yml files into a JSON array.
+          FILES="[]"
+          for f in .github/settings/*.yml; do
+            [ -f "$f" ] || continue
+            NAME=$(basename "$f")
+            FILES=$(jq --arg name "$NAME" --arg content "$(cat "$f")" \
+              '. + [{"name": $name, "content": $content}]' <<< "$FILES")
+          done
+
+          if [ "$FILES" = "[]" ]; then
+            echo "No settings files found"
+            exit 0
+          fi
+
+          # -f would discard the body on HTTP errors; we need the body
+          # (the API returns 422 with per-file errors when YAML is invalid).
+          HTTP_CODE=$(curl -s -o /tmp/validate-response.json \
+            -w '%{http_code}' \
+            -X POST "${API_URL}/api/validate" \
+            -H "Content-Type: application/json" \
+            -d "{\"files\": ${FILES}}")
+          RESPONSE=$(cat /tmp/validate-response.json)
+
+          {
+            echo "## Schema Validation"
+            echo "HTTP ${HTTP_CODE}"
+            echo '```json'
+            jq . <<< "$RESPONSE" 2>/dev/null || printf '%s\n' "$RESPONSE"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Anything outside 2xx/422 is a transport/server problem, not a
+          # validation result — surface it loudly.
+          if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "422" ]; then
+            echo "::error::Validate API returned HTTP ${HTTP_CODE}"
+            printf '%s\n' "$RESPONSE"
+            exit 1
+          fi
+
+          VALID=$(jq -r '.valid // false' <<< "$RESPONSE")
+          if [ "$VALID" != "true" ]; then
+            echo "::error::Schema validation failed — check the summary for details"
+            jq -r '.files[] | select(.valid == false) | "  \(.file): \(.errors | join("; "))"' <<< "$RESPONSE" 2>/dev/null
+            exit 1
+          fi
+          echo "All settings files are valid"
+
+      # --- Auth: STS ---
+      - name: Get STS token
+        if: inputs.auth-method == 'sts'
+        id: sts
+        uses: Depthmark/github-sts-action@6068d40ef75361b70501900e3345e0c65cbd5c44 # main
+        with:
+          sts-url: ${{ inputs.sts-url }}
+          scope: ${{ github.repository }}
+          identity: ${{ inputs.sts-identity }}
+          app: ${{ inputs.sts-app }}
+
+      # --- PR Check ---
+      - name: PR Check (dry-run)
+        if: github.event_name == 'pull_request'
+        env:
+          API_URL: ${{ inputs.api-url }}
+          AUTH_METHOD: ${{ inputs.auth-method }}
+          STS_TOKEN: ${{ steps.sts.outputs.token }}
+          API_SECRET: ${{ secrets.api-secret }}  # zizmor: ignore[secrets-outside-env]
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          # Build curl args as an array so word-splitting / quoting are clean.
+          HEADERS=( -H "Content-Type: application/json" )
+
+          if [ "$AUTH_METHOD" = "sts" ]; then
+            HEADERS+=( -H "Authorization: Bearer ${STS_TOKEN}" )
+          elif [ "$AUTH_METHOD" = "github-app" ]; then
+            HEADERS+=( -H "X-Auth-Method: github-app" )
+            if [ -n "$API_SECRET" ]; then
+              HEADERS+=( -H "Authorization: Bearer ${API_SECRET}" )
+            fi
+          fi
+
+          BODY=$(jq -n \
+            --arg owner "$REPO_OWNER" \
+            --arg repo "$REPO_NAME" \
+            --arg head_sha "$HEAD_SHA" \
+            --argjson pr_number "${PR_NUMBER:-null}" \
+            '{owner: $owner, repo: $repo, head_sha: $head_sha, pr_number: $pr_number}')
+
+          RESPONSE=$(curl -sf -X POST "${API_URL}/api/check" \
+            "${HEADERS[@]}" \
+            -d "$BODY")
+
+          {
+            echo "## repo-settings check"
+            echo '```json'
+            jq . <<< "$RESPONSE"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          CONCLUSION=$(jq -r '.conclusion // empty' <<< "$RESPONSE")
+          if [ "$CONCLUSION" = "failure" ]; then
+            echo "::error::Policy violations detected"
+            exit 1
+          fi
+
+      # --- Detect changed settings files (for selective reconciliation) ---
+      - name: Detect changed files
+        if: github.event_name == 'push'
+        id: changed
+        env:
+          # Pass commits via env, never inline `${{ ... }}` into shell.
+          COMMITS_JSON: ${{ toJSON(github.event.commits) }}
+        run: |
+          CHANGED=$(jq -r '.[].added + .[].modified + .[].removed | .[]' \
+            <<< "$COMMITS_JSON" 2>/dev/null \
+            | grep '^\.github/settings/' \
+            | sort -u \
+            | jq -R -s -c 'split("\n") | map(select(. != ""))')
+          echo "files=${CHANGED}" >> "$GITHUB_OUTPUT"
+          echo "Changed settings files: ${CHANGED}"
+
+      # --- Apply on merge ---
+      - name: Apply settings
+        if: github.event_name == 'push'
+        env:
+          API_URL: ${{ inputs.api-url }}
+          AUTH_METHOD: ${{ inputs.auth-method }}
+          STS_TOKEN: ${{ steps.sts.outputs.token }}
+          API_SECRET: ${{ secrets.api-secret }}  # zizmor: ignore[secrets-outside-env]
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          CHANGED_FILES: ${{ steps.changed.outputs.files }}
+        run: |
+          HEADERS=( -H "Content-Type: application/json" )
+
+          if [ "$AUTH_METHOD" = "sts" ]; then
+            HEADERS+=( -H "Authorization: Bearer ${STS_TOKEN}" )
+          elif [ "$AUTH_METHOD" = "github-app" ]; then
+            HEADERS+=( -H "X-Auth-Method: github-app" )
+            if [ -n "$API_SECRET" ]; then
+              HEADERS+=( -H "Authorization: Bearer ${API_SECRET}" )
+            fi
+          fi
+
+          BODY=$(jq -n \
+            --arg owner "$REPO_OWNER" \
+            --arg repo "$REPO_NAME" \
+            --argjson changed_files "${CHANGED_FILES:-[]}" \
+            '{owner: $owner, repo: $repo, changed_files: $changed_files}')
+
+          RESPONSE=$(curl -sf -X POST "${API_URL}/api/reconcile" \
+            "${HEADERS[@]}" \
+            -d "$BODY")
+
+          {
+            echo "## repo-settings applied"
+            echo '```json'
+            jq . <<< "$RESPONSE"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          ERRORS=$(jq -r '.errors // 0' <<< "$RESPONSE")
+          if [ "$ERRORS" != "0" ]; then
+            echo "::warning::Some settings failed to apply"
+          fi
