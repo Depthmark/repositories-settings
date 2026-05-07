@@ -18,7 +18,7 @@
 #     id-token: write
 #   jobs:
 #     settings:
-#       uses: Depthmark/repository-settings/.github/workflows/repo-settings.yml@main
+#       uses: Depthmark/repositories-settings/.github/workflows/repo-settings.yml@main
 #       with:
 #         auth-method: sts              # or "github-app"
 #         # STS options (if auth-method: sts)

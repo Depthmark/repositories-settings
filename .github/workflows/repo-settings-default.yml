@@ -18,7 +18,7 @@
 #     id-token: write
 #   jobs:
 #     settings:
-#       uses: Depthmark/repository-settings/.github/workflows/repo-settings-default.yml@main
+#       uses: Depthmark/repositories-settings/.github/workflows/repo-settings-default.yml@main
 #       with:
 #         api-url: https://repository-settings.example.com
 #         sts-url: https://github-sts.example.com
