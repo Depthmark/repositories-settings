@@ -16,6 +16,7 @@
 #     contents: read
 #     checks: write
 #     id-token: write
+#     pull-requests: write    # for the dry-run sticky comment
 #   jobs:
 #     settings:
 #       uses: Depthmark/repositories-settings/.github/workflows/repo-settings.yml@main
@@ -72,7 +73,8 @@ jobs:
     permissions:
       contents: read
       checks: write
-      id-token: write   # Required for STS OIDC token
+      id-token: write       # Required for STS OIDC token
+      pull-requests: write  # Required for the dry-run sticky PR comment
     steps:
       # --- Pre-flight: validate YAML schemas ---
       - name: Checkout
@@ -144,6 +146,7 @@ jobs:
 
       # --- PR Check ---
       - name: PR Check (dry-run)
+        id: check
         if: github.event_name == 'pull_request'
         env:
           API_URL: ${{ inputs.api-url }}
@@ -174,21 +177,103 @@ jobs:
             --argjson pr_number "${PR_NUMBER:-null}" \
             '{owner: $owner, repo: $repo, head_sha: $head_sha, pr_number: $pr_number}')
 
-          RESPONSE=$(curl -sf -X POST "${API_URL}/api/check" \
+          # -s + -o + -w lets us see the body even on non-2xx, instead
+          # of having `-f` swallow everything with exit code 22.
+          HTTP_CODE=$(curl -s -o /tmp/check.json -w '%{http_code}' \
+            -X POST "${API_URL}/api/check" \
             "${HEADERS[@]}" \
             -d "$BODY")
 
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "::error::/api/check returned HTTP ${HTTP_CODE}"
+            cat /tmp/check.json
+            exit 1
+          fi
+
+          CONCLUSION=$(jq -r '.conclusion // "unknown"' /tmp/check.json)
+          # Persist the markdown summary to a file so the comment step
+          # can read it without round-tripping through GITHUB_OUTPUT
+          # (which is fragile for multi-line markdown with backticks).
+          jq -r '.summary // ""' /tmp/check.json > /tmp/check.md
+
+          # Print the markdown summary inline so a reviewer scrolling
+          # the run logs sees the diff without leaving the page.
+          echo "::group::repo-settings dry-run (${CONCLUSION})"
+          cat /tmp/check.md
+          echo "::endgroup::"
+
+          # Mirror to the step summary as the same markdown the bot's
+          # sticky PR comment uses (Not allowed / Create / Update / Delete
+          # sections), not raw JSON — much more readable.
           {
-            echo "## repo-settings check"
-            echo '```json'
-            jq . <<< "$RESPONSE"
-            echo '```'
+            echo "## repo-settings — dry run (\`${CONCLUSION}\`)"
+            cat /tmp/check.md
           } >> "$GITHUB_STEP_SUMMARY"
 
-          CONCLUSION=$(jq -r '.conclusion // empty' <<< "$RESPONSE")
+          # Expose conclusion to the comment step. The step runs with
+          # `if: always()` and reads /tmp/check.md directly.
+          echo "conclusion=${CONCLUSION}" >> "$GITHUB_OUTPUT"
+
           if [ "$CONCLUSION" = "failure" ]; then
-            echo "::error::Policy violations detected"
+            echo "::error::dry-run reported lane errors — see Not allowed changes section"
+            jq -r '
+              .report.applied[]
+              | select(.success == false)
+              | "  - \(.resource) (\(.action)): \(.error)"
+            ' /tmp/check.json
             exit 1
+          fi
+
+      # --- Sticky PR comment ---
+      # Find by marker → PATCH if present, else POST a new comment.
+      # Uses the GitHub-issued GITHUB_TOKEN, no third-party action.
+      # Runs even when PR Check exited 1 (always()) so a failed dry-run
+      # still leaves the breakdown on the PR. continue-on-error so a
+      # transient comment failure doesn't mask the real check result.
+      - name: Comment dry-run on PR
+        if: always() && github.event_name == 'pull_request' && steps.check.outputs.conclusion != ''
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          CONCLUSION: ${{ steps.check.outputs.conclusion }}
+        run: |
+          set -euo pipefail
+          MARKER='<!-- repo-settings:workflow -->'
+
+          # Compose the comment body. The marker stays on its own line
+          # at the top so the find-by-prefix lookup is unambiguous.
+          {
+            printf '%s\n\n' "$MARKER"
+            echo "## repo-settings — dry run (\`${CONCLUSION}\`)"
+            echo
+            if [ -s /tmp/check.md ]; then
+              cat /tmp/check.md
+            else
+              echo "_No summary returned by /api/check._"
+            fi
+            echo
+            printf '<sub>Run: [%s](%s/%s/actions/runs/%s)</sub>\n' \
+              "$GITHUB_RUN_ID" "$GITHUB_SERVER_URL" "$REPO" "$GITHUB_RUN_ID"
+          } > /tmp/comment.md
+
+          # Wrap the body in a JSON object once, then feed both POST
+          # and PATCH from the same payload — keeps the two paths
+          # symmetrical and avoids re-encoding.
+          jq -Rs '{body: .}' < /tmp/comment.md > /tmp/comment.json
+
+          EXISTING_ID=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" \
+            --jq ".[] | select(.body | startswith(\"$MARKER\")) | .id" | head -n1)
+
+          if [ -n "$EXISTING_ID" ]; then
+            echo "Updating sticky comment ${EXISTING_ID}"
+            gh api --method PATCH "repos/$REPO/issues/comments/$EXISTING_ID" \
+              --input /tmp/comment.json > /dev/null
+          else
+            echo "Posting new sticky comment"
+            gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" \
+              --input /tmp/comment.json > /dev/null
           fi
 
       # --- Detect changed settings files (for selective reconciliation) ---

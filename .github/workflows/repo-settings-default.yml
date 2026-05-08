@@ -16,6 +16,7 @@
 #     contents: read
 #     checks: write
 #     id-token: write
+#     pull-requests: write    # for the dry-run sticky comment
 #   jobs:
 #     settings:
 #       uses: Depthmark/repositories-settings/.github/workflows/repo-settings-default.yml@main
@@ -54,6 +55,7 @@ jobs:
       contents: read
       checks: write
       id-token: write
+      pull-requests: write
     with:
       api-url: ${{ inputs.api-url }}
       auth-method: sts
