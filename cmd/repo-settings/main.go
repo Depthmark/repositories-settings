@@ -76,7 +76,15 @@ func main() {
 		Logger:  log,
 	})
 
-	rec := reconciler.New(log)
+	disabled, unknownDisabled := config.ParseDisabledResources(os.Getenv("DISABLED_RESOURCES"))
+	for _, k := range unknownDisabled {
+		log.Warn("DISABLED_RESOURCES contains unknown key (ignored)", "key", k)
+	}
+	if keys := disabled.Keys(); len(keys) > 0 {
+		log.Info("operator-disabled resources", "keys", keys)
+	}
+
+	rec := reconciler.New(log).WithDisabled(disabled)
 
 	// Settings loader closure: reads .github/settings/*.yml from the
 	// target repo at the given ref. No org/suborg layering yet — that's
@@ -87,14 +95,15 @@ func main() {
 	}
 
 	srv := server.New(addr, server.Deps{
-		Logger:        log,
-		Client:        cl,
-		Reconciler:    rec,
-		WebhookSecret: []byte(os.Getenv("WEBHOOK_SECRET")),
-		APIToken:      os.Getenv("API_TOKEN"),
-		Registry:      registry,
-		Settings:      settingsLoader,
-		AppSlug:       env("APP_SLUG", "repo-settings"),
+		Logger:            log,
+		Client:            cl,
+		Reconciler:        rec,
+		WebhookSecret:     []byte(os.Getenv("WEBHOOK_SECRET")),
+		APIToken:          os.Getenv("API_TOKEN"),
+		Registry:          registry,
+		Settings:          settingsLoader,
+		AppSlug:           env("APP_SLUG", "repo-settings"),
+		DisabledResources: disabled,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

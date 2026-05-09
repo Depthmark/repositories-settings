@@ -1,0 +1,134 @@
+# Example workflow for repos that want to drive the repo-settings
+# service from GitHub Actions instead of (or alongside) the App webhook.
+#
+# Two paths:
+#   1. pull_request — every PR that touches .github/settings/** runs a
+#      dry-run and posts the diff as a sticky PR comment.
+#   2. workflow_dispatch — a maintainer can manually request a dry-run
+#      or a real apply against the default branch.
+#
+# Required repo secrets:
+#   REPO_SETTINGS_URL    — base URL of the repo-settings service
+#                          (e.g. https://repo-settings.example.com)
+#   REPO_SETTINGS_TOKEN  — value of API_TOKEN configured on the service
+#
+# Note on the App webhook: if your org has the repo-settings GitHub App
+# installed, it already posts a sticky PR comment on PR open / sync.
+# Running this workflow in addition produces TWO comments per PR (the
+# stickies use different markers and don't collide). Pick one source of
+# truth — either uninstall the App on these repos or remove this
+# workflow — to avoid that duplication.
+
+name: repo-settings
+
+on:
+  pull_request:
+    paths:
+      - ".github/settings/**"
+      - ".github/workflows/repo-settings-check.yml"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Run mode against the default branch."
+        required: true
+        type: choice
+        default: dry-run
+        options:
+          - dry-run
+          - apply
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  # PR dry-run: read-only, posts the sticky diff comment.
+  # Skips fork PRs because secrets aren't injected for them; the App
+  # webhook is the right place to validate fork contributions.
+  pr-check:
+    if: |
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call /api/check
+        id: check
+        env:
+          URL: ${{ secrets.REPO_SETTINGS_URL }}
+          TOKEN: ${{ secrets.REPO_SETTINGS_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          payload=$(jq -n \
+            --arg owner "$OWNER" \
+            --arg repo  "$REPO" \
+            --arg sha   "$HEAD_SHA" \
+            --argjson pr "$PR" \
+            '{owner:$owner, repo:$repo, head_sha:$sha, pr_number:$pr}')
+          curl -sS -X POST "$URL/api/check" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "$payload" \
+            -o /tmp/check.json
+          echo "conclusion=$(jq -r .conclusion /tmp/check.json)" >> "$GITHUB_OUTPUT"
+          {
+            echo 'summary<<REPO_SETTINGS_EOF'
+            jq -r .summary /tmp/check.json
+            echo REPO_SETTINGS_EOF
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upsert sticky PR comment
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: repo-settings-check
+          message: |
+            ## repo-settings — dry run (`${{ steps.check.outputs.conclusion }}`)
+
+            ${{ steps.check.outputs.summary }}
+
+            <sub>Run: [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})</sub>
+
+      - name: Fail the check on a lane error
+        if: steps.check.outputs.conclusion == 'failure'
+        run: |
+          echo "::error::repo-settings reported a lane failure during the dry-run"
+          exit 1
+
+  # Manual run against the default branch. Requires write access to
+  # dispatch the workflow, so an "apply" choice is already gated on the
+  # same permission as `@repo-settings apply` from a PR comment.
+  manual:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call /api/reconcile
+        env:
+          URL: ${{ secrets.REPO_SETTINGS_URL }}
+          TOKEN: ${{ secrets.REPO_SETTINGS_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          DRY_RUN: ${{ inputs.mode == 'dry-run' }}
+        run: |
+          set -euo pipefail
+          payload=$(jq -n \
+            --arg owner "$OWNER" \
+            --arg repo  "$REPO" \
+            --argjson dry "$DRY_RUN" \
+            '{owner:$owner, repo:$repo, dry_run:$dry}')
+          curl -sS -X POST "$URL/api/reconcile" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "$payload" \
+            -o /tmp/reconcile.json
+          echo "## repo-settings — ${{ inputs.mode }}" >> "$GITHUB_STEP_SUMMARY"
+          jq -r '
+            "Applied \(.applied | length) result(s); failures: \([.applied[] | select(.success==false)] | length)"
+          ' /tmp/reconcile.json >> "$GITHUB_STEP_SUMMARY"
+          # Surface non-zero exit when any lane failed during a real apply.
+          if [ "$DRY_RUN" = "false" ] && jq -e '[.applied[] | select(.success==false)] | length > 0' /tmp/reconcile.json > /dev/null; then
+            echo "::error::one or more lanes failed during apply"
+            exit 1
+          fi

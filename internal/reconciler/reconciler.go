@@ -40,10 +40,22 @@ type Prefetched struct {
 // Reconciler is constructed once and reused across reconciles.
 type Reconciler struct {
 	logger *slog.Logger
+	// Disabled is the operator-level deny-set. Lanes whose key appears
+	// here are skipped during reconcile and surfaced as Skipped Results
+	// in the report so users see what got ignored. Nil = nothing
+	// disabled.
+	Disabled config.DisabledResources
 }
 
 func New(logger *slog.Logger) *Reconciler {
 	return &Reconciler{logger: logger}
+}
+
+// WithDisabled returns r with the given disabled set installed. Used
+// at boot from main once DISABLED_RESOURCES has been parsed.
+func (r *Reconciler) WithDisabled(d config.DisabledResources) *Reconciler {
+	r.Disabled = d
+	return r
 }
 
 // Reconcile runs the phased reconcile for one repo.
@@ -71,62 +83,56 @@ func (r *Reconciler) Reconcile(
 	}
 
 	// Phase A: repo + topics (sequential — gates archival / visibility).
+	// "repository" lane covers both repo settings and topics; disabling
+	// it skips the whole phase and emits one synthetic Skipped Result
+	// so the user sees their config wasn't applied.
 	if settings.Repo != nil || settings.Topics != nil {
-		var pf *applier.PrefetchedRepo
-		if prefetched != nil {
-			pf = prefetched.Repo
+		if r.Disabled.Has("repository") {
+			rep.Applied = append(rep.Applied, skippedResult("repository"))
+			log.Info("phase A skipped (operator-disabled)", "lane", "repository")
+		} else {
+			var pf *applier.PrefetchedRepo
+			if prefetched != nil {
+				pf = prefetched.Repo
+			}
+			lane := applier.NewRepoLane(settings, pf)
+			ds, ap := r.runLane(ctx, lane, cl, repo, dryRun, log)
+			rep.Diffs = append(rep.Diffs, ds...)
+			rep.Applied = append(rep.Applied, ap...)
 		}
-		lane := applier.NewRepoLane(settings, pf)
-		ds, ap := r.runLane(ctx, lane, cl, repo, dryRun, log)
-		rep.Diffs = append(rep.Diffs, ds...)
-		rep.Applied = append(rep.Applied, ap...)
 	}
 
-	// Phase B: parallel lanes for the rest. Build only the lanes we
-	// have config for so we don't spend goroutines on unmanaged
-	// resources.
-	lanes := []applier.Lane{}
-	if l := applier.NewTeamsLane(settings.Teams); l.Run != nil {
-		lanes = append(lanes, l)
+	// Phase B: parallel lanes for the rest. We build a (key, lane) spec
+	// list and let applyDisabled() filter it: if the key is in the
+	// operator deny-set, the lane is replaced by a Skipped Result; if
+	// the lane is unconfigured (Run == nil) it's dropped silently.
+	specs := []laneSpec{
+		{"teams", applier.NewTeamsLane(settings.Teams)},
+		{"rulesets", applier.NewRulesetsLane(settings.Rulesets)},
+		{"environments", applier.NewEnvironmentsLane(settings.Environments)},
+		{"webhooks", applier.NewWebhooksLane(settings.Webhooks)},
+		{"autolinks", applier.NewAutolinksLane(settings.Autolinks)},
+		{"actions", applier.NewActionsLane(settings.Actions)},
+		{"security", applier.NewSecurityLane(settings.Security)},
+		{"pages", applier.NewPagesLane(settings.Pages)},
+		{"secrets", applier.NewSecretsLane(settings.Secrets)},
+		{"variables", applier.NewVariablesLane(settings.Variables)},
+		{"deploy_keys", applier.NewDeployKeysLane(settings.DeployKeys)},
+		{"custom_properties", applier.NewCustomPropertiesLane(settings.CustomProperties)},
+		{"collaborators", applier.NewCollaboratorsLane(settings.Collaborators)},
+		{"branches", applier.NewBranchesLane(settings.Branches)},
 	}
-	if l := applier.NewRulesetsLane(settings.Rulesets); l.Run != nil {
-		lanes = append(lanes, l)
-	}
-	if l := applier.NewEnvironmentsLane(settings.Environments); l.Run != nil {
-		lanes = append(lanes, l)
-	}
-	if l := applier.NewWebhooksLane(settings.Webhooks); l.Run != nil {
-		lanes = append(lanes, l)
-	}
-	if l := applier.NewAutolinksLane(settings.Autolinks); l.Run != nil {
-		lanes = append(lanes, l)
-	}
-	if l := applier.NewActionsLane(settings.Actions); l.Run != nil {
-		lanes = append(lanes, l)
-	}
-	if l := applier.NewSecurityLane(settings.Security); l.Run != nil {
-		lanes = append(lanes, l)
-	}
-	if l := applier.NewPagesLane(settings.Pages); l.Run != nil {
-		lanes = append(lanes, l)
-	}
-	if l := applier.NewSecretsLane(settings.Secrets); l.Run != nil {
-		lanes = append(lanes, l)
-	}
-	if l := applier.NewVariablesLane(settings.Variables); l.Run != nil {
-		lanes = append(lanes, l)
-	}
-	if l := applier.NewDeployKeysLane(settings.DeployKeys); l.Run != nil {
-		lanes = append(lanes, l)
-	}
-	if l := applier.NewCustomPropertiesLane(settings.CustomProperties); l.Run != nil {
-		lanes = append(lanes, l)
-	}
-	if l := applier.NewCollaboratorsLane(settings.Collaborators); l.Run != nil {
-		lanes = append(lanes, l)
-	}
-	if l := applier.NewBranchesLane(settings.Branches); l.Run != nil {
-		lanes = append(lanes, l)
+	lanes := make([]applier.Lane, 0, len(specs))
+	for _, s := range specs {
+		if s.lane.Run == nil {
+			continue
+		}
+		if r.Disabled.Has(s.key) {
+			rep.Applied = append(rep.Applied, skippedResult(s.key))
+			log.Info("lane skipped (operator-disabled)", "lane", s.key)
+			continue
+		}
+		lanes = append(lanes, s.lane)
 	}
 
 	type laneOut struct {
@@ -246,4 +252,26 @@ func failures(rs []applier.Result) int {
 		}
 	}
 	return n
+}
+
+// laneSpec pairs a canonical resource key (used by the operator
+// deny-set and the report's Skipped section) with the constructed
+// Lane. Lanes whose Run is nil are unconfigured and dropped without
+// any Result entry.
+type laneSpec struct {
+	key  string
+	lane applier.Lane
+}
+
+// skippedResult is the synthetic Result we emit for a lane the
+// operator has disabled. Success=true so the dry-run conclusion stays
+// "neutral" instead of "failure"; the message goes in Error so it
+// renders consistently in the Skipped section of FormatReportMarkdown.
+func skippedResult(key string) applier.Result {
+	return applier.Result{
+		Resource: key,
+		Action:   applier.Skipped,
+		Success:  true,
+		Error:    "disabled by operator policy",
+	}
 }

@@ -98,6 +98,7 @@ Environment variables (all optional; sensible defaults):
 | `GITHUB_WEBHOOK_SECRET`          | (none)                   | HMAC secret; if set, `/webhook` rejects unsigned payloads  |
 | `API_TOKEN`                      | (none)                   | If set, `/api/reconcile` requires `Authorization: Bearer …`|
 | `APP_SLUG`                       | `repo-settings`          | The bot's @-name; used to recognise PR-comment commands    |
+| `DISABLED_RESOURCES`             | (none)                   | CSV of resource keys the deployment refuses to manage (see [Disabling resources](#disabling-resources)) |
 
 ## Endpoints
 
@@ -228,6 +229,56 @@ either:
 - a list of validation errors when `.github/settings/*.yml` can't be
   parsed at the PR's head SHA, with the offending file names and the
   exact issues to fix.
+
+## Disabling resources
+
+Operators can refuse to manage specific resource types by setting
+`DISABLED_RESOURCES` to a comma-separated list. The service still
+accepts the YAML; it just never reads or writes those resources from
+GitHub. Useful when a deployment shouldn't touch certain settings for
+compliance reasons (e.g. secrets stored elsewhere, pages locked down
+at the org level).
+
+```env
+DISABLED_RESOURCES=pages,secrets,deploy_keys
+```
+
+Recognised keys (snake_case canonical, hyphens accepted as aliases):
+
+```
+repository  teams      rulesets   environments  webhooks
+autolinks   actions    security   pages         secrets
+variables   deploy_keys (or deploy-keys)
+custom_properties (or custom-properties)
+collaborators  branches
+```
+
+Disabling `repository` covers both repo settings and topics, since
+they ride the same Phase A lane.
+
+### What users see
+
+When `secrets` is disabled but a repo's `secrets.yml` still defines
+secrets, the user gets explicit feedback in three places, not silence:
+
+1. **PR sticky comment / `/api/check`** — a "Skipped — operator policy"
+   section above the diff, listing each disabled-but-configured
+   resource with the reason `disabled by operator policy`.
+2. **`/api/validate`** — per-file `disabled: ["secrets"]` warnings plus
+   a top-level rollup. Validation **does not fail** (the YAML is
+   structurally fine); the section is just inert.
+3. **Reconcile report / Prometheus** — one `Result{action: "skipped",
+   success: true, error: "disabled by operator policy"}` per disabled
+   lane; metric `applier_total{action="skipped",status="success"}`
+   so dashboards can chart it.
+
+The reconciler **never reads live state** for disabled lanes — no
+GitHub API calls, no permission checks. The repo's YAML stays in
+place so when the operator re-enables the resource, it just resumes
+working without the user having to redo their config.
+
+Unknown keys in `DISABLED_RESOURCES` log a warning at boot rather than
+silently mis-spelling the gate; check the startup logs after edits.
 
 ## Driving via GitHub Actions
 

@@ -13,7 +13,6 @@ import (
 	"strings"
 
 	"github.com/Depthmark/repositories-settings/internal/config"
-	"github.com/Depthmark/repositories-settings/internal/diff"
 	"github.com/Depthmark/repositories-settings/internal/metrics"
 	"github.com/Depthmark/repositories-settings/internal/reconciler"
 )
@@ -254,24 +253,12 @@ func (h *webhookHandler) commentError(ctx context.Context, repo config.Repo, prN
 }
 
 // formatDryRunComment is the body of the sticky comment we post on
-// PR opens / synchronize. It always includes the trigger headers and
-// either a "no changes" line or the markdown diff table.
+// PR opens / synchronize. The formatter owns the entire body —
+// including the verdict line and the apply hint — so the bot's
+// sticky comment and the workflow's /api/check `summary` are
+// byte-identical. No wrapper here.
 func formatDryRunComment(rep *reconciler.Report) string {
-	var b strings.Builder
-	b.WriteString("## repo-settings — dry run\n\n")
-	if anyLaneFailed(rep.Applied) {
-		b.WriteString(":warning: One or more lanes reported errors during the dry run.\n\n")
-		for _, r := range rep.Applied {
-			if r.Success {
-				continue
-			}
-			fmt.Fprintf(&b, "- `%s`: %s\n", r.Resource, r.Error)
-		}
-		b.WriteString("\n")
-	}
-	b.WriteString(diff.FormatMarkdown(rep.Diffs))
-	b.WriteString("\n\n_Triggered by repo-settings. Comment `recheck` to refresh, `apply` to apply now._")
-	return b.String()
+	return reconciler.FormatReportMarkdown(rep)
 }
 
 // formatApplyReport is the body posted after a successful apply.

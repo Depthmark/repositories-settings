@@ -13,6 +13,10 @@ import (
 	"github.com/Depthmark/repositories-settings/internal/reconciler"
 )
 
+// reuse the formatter shared with the bot's sticky PR comment so the
+// /api/check `summary` looks identical to what the bot posts.
+var formatReport = reconciler.FormatReportMarkdown
+
 type reconcileHandler struct {
 	deps Deps
 }
@@ -120,7 +124,7 @@ func (h *checkHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	metrics.PRCheckTotal.WithLabelValues(conclusion).Inc()
 	writeJSON(w, http.StatusOK, checkResponse{
 		Conclusion: conclusion,
-		Summary:    diff.FormatMarkdown(rep.Diffs),
+		Summary:    formatReport(rep),
 		Report:     rep,
 	})
 }
@@ -157,11 +161,22 @@ type validateRequest struct {
 type validateResponse struct {
 	Valid bool                  `json:"valid"`
 	Files []validateFileOutcome `json:"files"`
+	// Disabled lists the operator-disabled resource keys touched by
+	// any of the submitted files. Top-level rollup so callers can
+	// branch on "are any disabled sections in play?" without scanning
+	// per-file outcomes. Empty when the operator hasn't disabled
+	// anything or none of the files reference a disabled resource.
+	Disabled []string `json:"disabled,omitempty"`
 }
 type validateFileOutcome struct {
 	File   string   `json:"file"`
 	Valid  bool     `json:"valid"`
 	Issues []string `json:"issues,omitempty"`
+	// Disabled lists the canonical resource keys this file configures
+	// that the operator has disabled. The file itself is structurally
+	// valid (Valid=true); the warning is "your YAML is fine but the
+	// service will ignore this section."
+	Disabled []string `json:"disabled,omitempty"`
 }
 
 func (h *validateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -212,6 +227,25 @@ func (h *validateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	for _, f := range req.Files {
 		if !mentioned[f.Name] {
 			out.Files = append(out.Files, validateFileOutcome{File: f.Name, Valid: true})
+		}
+	}
+
+	// Annotate each file with any operator-disabled resources it
+	// configures. We do this after structural validation so a syntactically
+	// broken file still gets its `issues`, plus the disabled warning if
+	// the file's identity is known.
+	if len(h.deps.DisabledResources) > 0 {
+		seenTopLevel := map[string]bool{}
+		for i, f := range out.Files {
+			for _, key := range config.ResourceKeysForFile(f.File) {
+				if h.deps.DisabledResources.Has(key) {
+					out.Files[i].Disabled = append(out.Files[i].Disabled, key)
+					if !seenTopLevel[key] {
+						seenTopLevel[key] = true
+						out.Disabled = append(out.Disabled, key)
+					}
+				}
+			}
 		}
 	}
 	writeJSON(w, http.StatusOK, out)

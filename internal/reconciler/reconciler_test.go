@@ -158,6 +158,106 @@ func TestReconcile_DryRunSkipsApply(t *testing.T) {
 	}
 }
 
+// Operator-disabled lanes: when the repo's YAML defines a section
+// the operator has globally disabled, the reconciler must NOT call
+// any GitHub endpoint for that lane and must record one synthetic
+// Skipped Result so the user sees what got dropped.
+func TestReconcile_DisabledLanesAreSkippedNotApplied(t *testing.T) {
+	var pagesHits int32
+	var secretsHits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repos/o/r" && r.Method == http.MethodGet:
+			_ = json.NewEncoder(w).Encode(map[string]any{"description": "x"})
+		case strings.HasPrefix(r.URL.Path, "/repos/o/r/pages"):
+			atomic.AddInt32(&pagesHits, 1)
+			w.WriteHeader(404)
+		case strings.HasPrefix(r.URL.Path, "/repos/o/r/actions/secrets"):
+			atomic.AddInt32(&secretsHits, 1)
+			w.WriteHeader(404)
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer srv.Close()
+
+	rl := ghclient.NewRateLimiter(logger.Discard(), ghclient.Options{Concurrency: 5})
+	defer rl.Stop()
+	cl := ghclient.New(ghclient.Config{
+		APIURL: srv.URL, Limiter: rl, HTTPClient: srv.Client(), Logger: logger.Discard(),
+	})
+
+	build := "workflow"
+	settings := &config.Settings{
+		Pages:   &config.PagesConfig{BuildType: &build},
+		Secrets: &config.SecretsConfig{RepositorySecrets: []config.SecretRef{{Name: "FOO"}}},
+	}
+
+	disabled, _ := config.ParseDisabledResources("pages,secrets")
+	r := New(logger.Discard()).WithDisabled(disabled)
+	rep, err := r.Reconcile(context.Background(), cl,
+		config.Repo{Owner: "o", Name: "r"}, settings, config.TriggerManual, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Zero traffic to the disabled endpoints — the lane must not
+	// even read live state.
+	if got := atomic.LoadInt32(&pagesHits); got != 0 {
+		t.Errorf("pages endpoint hit %d times despite being disabled", got)
+	}
+	if got := atomic.LoadInt32(&secretsHits); got != 0 {
+		t.Errorf("secrets endpoint hit %d times despite being disabled", got)
+	}
+
+	// Exactly one Skipped Result per disabled-and-configured lane.
+	skipped := map[string]bool{}
+	for _, res := range rep.Applied {
+		if res.Action != "skipped" {
+			continue
+		}
+		if !res.Success {
+			t.Errorf("Skipped Result must be Success=true so it doesn't trip 'failure' conclusion: %+v", res)
+		}
+		if res.Error != "disabled by operator policy" {
+			t.Errorf("unexpected Skipped reason: %q", res.Error)
+		}
+		skipped[res.Resource] = true
+	}
+	if !skipped["pages"] || !skipped["secrets"] {
+		t.Fatalf("expected Skipped Results for pages + secrets, got %v", skipped)
+	}
+}
+
+// Disabling a lane the repo never configured is a noop — no Skipped
+// Result, no GitHub calls. We don't want unconfigured lanes spamming
+// the report with skipped entries every reconcile.
+func TestReconcile_DisabledButUnconfiguredEmitsNothing(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(404)
+	}))
+	defer srv.Close()
+
+	rl := ghclient.NewRateLimiter(logger.Discard(), ghclient.Options{Concurrency: 1})
+	defer rl.Stop()
+	cl := ghclient.New(ghclient.Config{
+		APIURL: srv.URL, Limiter: rl, HTTPClient: srv.Client(), Logger: logger.Discard(),
+	})
+
+	disabled, _ := config.ParseDisabledResources("pages,secrets,deploy_keys")
+	r := New(logger.Discard()).WithDisabled(disabled)
+	rep, err := r.Reconcile(context.Background(), cl,
+		config.Repo{Owner: "o", Name: "r"}, &config.Settings{}, config.TriggerManual, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, res := range rep.Applied {
+		if res.Action == "skipped" {
+			t.Fatalf("unexpected Skipped Result for unconfigured lane: %+v", res)
+		}
+	}
+}
+
 func TestReconcile_LaneFailureIsolated(t *testing.T) {
 	// teams endpoint returns 500; reconcile should still finish and
 	// produce a synthetic failure for that lane.

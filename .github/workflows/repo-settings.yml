@@ -110,11 +110,14 @@ jobs:
           RESPONSE=$(cat /tmp/validate-response.json)
 
           {
-            echo "## Schema Validation"
-            echo "HTTP ${HTTP_CODE}"
+            echo "<details>"
+            echo "<summary>Schema Validation — HTTP ${HTTP_CODE}</summary>"
+            echo
             echo '```json'
             jq . <<< "$RESPONSE" 2>/dev/null || printf '%s\n' "$RESPONSE"
             echo '```'
+            echo
+            echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
 
           # Anything outside 2xx/422 is a transport/server problem, not a
@@ -197,25 +200,24 @@ jobs:
           jq -r '.summary // ""' /tmp/check.json > /tmp/check.md
 
           # Print the markdown summary inline so a reviewer scrolling
-          # the run logs sees the diff without leaving the page.
+          # the run logs sees the diff without leaving the page. The
+          # /api/check `summary` already starts with its own H2
+          # verdict line, so we don't add another one here.
           echo "::group::repo-settings dry-run (${CONCLUSION})"
           cat /tmp/check.md
           echo "::endgroup::"
 
-          # Mirror to the step summary as the same markdown the bot's
-          # sticky PR comment uses (Not allowed / Create / Update / Delete
-          # sections), not raw JSON — much more readable.
-          {
-            echo "## repo-settings — dry run (\`${CONCLUSION}\`)"
-            cat /tmp/check.md
-          } >> "$GITHUB_STEP_SUMMARY"
+          # Mirror to the step summary verbatim — the formatter owns
+          # the verdict, sections, and apply hint, so the step summary
+          # and the sticky PR comment are byte-identical.
+          cat /tmp/check.md >> "$GITHUB_STEP_SUMMARY"
 
           # Expose conclusion to the comment step. The step runs with
           # `if: always()` and reads /tmp/check.md directly.
           echo "conclusion=${CONCLUSION}" >> "$GITHUB_OUTPUT"
 
           if [ "$CONCLUSION" = "failure" ]; then
-            echo "::error::dry-run reported lane errors — see Not allowed changes section"
+            echo "::error::dry-run reported lane errors — see Errors section"
             jq -r '
               .report.applied[]
               | select(.success == false)
@@ -242,12 +244,15 @@ jobs:
           set -euo pipefail
           MARKER='<!-- repo-settings:workflow -->'
 
-          # Compose the comment body. The marker stays on its own line
-          # at the top so the find-by-prefix lookup is unambiguous.
+          # Compose the comment body. The /api/check `summary` field
+          # is the entire comment — verdict line, sections, apply hint
+          # — so we just sandwich it between the find-by-prefix marker
+          # and a footer linking back to the run. No wrapper headers:
+          # the formatter is the single source of truth for layout, so
+          # the bot's webhook-driven comment and this workflow-driven
+          # comment look identical.
           {
             printf '%s\n\n' "$MARKER"
-            echo "## repo-settings — dry run (\`${CONCLUSION}\`)"
-            echo
             if [ -s /tmp/check.md ]; then
               cat /tmp/check.md
             else

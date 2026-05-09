@@ -35,6 +35,10 @@ type Deps struct {
 	// AppSlug is the GitHub App's URL slug (e.g. "repo-settings"); used
 	// to recognise mentions in PR comments. Falls back to "repo-settings".
 	AppSlug string
+	// DisabledResources is the operator-level deny-set surfaced both
+	// to /api/validate (warns when YAML configures a disabled section)
+	// and used to populate the Reconciler's deny-set at boot.
+	DisabledResources config.DisabledResources
 }
 
 // Server wraps the http.Server plus a readiness flag for /readyz.
