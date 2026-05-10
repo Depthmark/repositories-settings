@@ -25,7 +25,7 @@ jobs:
         id: sts
         with:
           sts-url: https://github-sts-dev.adelisle.com
-          scope: Depthmark/template-go
+          scope: Depthmark/repositories-settings
           identity: release
           app: depthmark-release-bot
 
