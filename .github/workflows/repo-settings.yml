@@ -320,24 +320,61 @@ jobs:
             fi
           fi
 
+          set -euo pipefail
+
           BODY=$(jq -n \
             --arg owner "$REPO_OWNER" \
             --arg repo "$REPO_NAME" \
             --argjson changed_files "${CHANGED_FILES:-[]}" \
             '{owner: $owner, repo: $repo, changed_files: $changed_files}')
 
-          RESPONSE=$(curl -sf -X POST "${API_URL}/api/reconcile" \
+          # -s + -o + -w lets us see the body even on non-2xx, instead
+          # of having `-f` swallow everything with exit code 22. We need
+          # the body either way (per-lane errors live in applied[]).
+          HTTP_CODE=$(curl -s -o /tmp/reconcile.json -w '%{http_code}' \
+            -X POST "${API_URL}/api/reconcile" \
             "${HEADERS[@]}" \
             -d "$BODY")
 
           {
-            echo "## repo-settings applied"
+            echo "## repo-settings applied (HTTP ${HTTP_CODE})"
             echo '```json'
-            jq . <<< "$RESPONSE"
+            jq . /tmp/reconcile.json 2>/dev/null || cat /tmp/reconcile.json
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-          ERRORS=$(jq -r '.errors // 0' <<< "$RESPONSE")
-          if [ "$ERRORS" != "0" ]; then
-            echo "::warning::Some settings failed to apply"
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "::error::/api/reconcile returned HTTP ${HTTP_CODE}"
+            cat /tmp/reconcile.json
+            exit 1
+          fi
+
+          # The server runs every lane to completion in parallel; per-lane
+          # failures (e.g. 403 from missing perms, 422 from GitHub
+          # rejecting a value) are embedded in applied[] with
+          # success=false alongside the successful creates/updates/deletes.
+          # Print every lane's outcome to the run log so the operator sees
+          # the full feedback loop — what was created/updated/deleted and
+          # what failed — in one place. We only decide the exit code
+          # after surfacing everything.
+          echo "::group::repo-settings — per-lane results"
+          jq -r '
+            .applied[]
+            | if .success and .action == "skipped" then
+                "  - \(.resource) skipped: \(.error // "no reason")"
+              elif .success then
+                "  ok   \(.resource) (\(.action))"
+              else
+                "  FAIL \(.resource) (\(.action)): \(.error)"
+              end
+          ' /tmp/reconcile.json
+          echo "::endgroup::"
+
+          TOTAL=$(jq '.applied | length' /tmp/reconcile.json)
+          FAILED=$(jq '[.applied[] | select(.success == false)] | length' /tmp/reconcile.json)
+          echo "Lanes: ${TOTAL} total, ${FAILED} failed"
+
+          if [ "$FAILED" -gt 0 ]; then
+            echo "::error::${FAILED}/${TOTAL} lane(s) failed during apply — see per-lane results above"
+            exit 1
           fi
