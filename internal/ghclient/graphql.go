@@ -113,3 +113,59 @@ func (c *Client) fetchBatchChunk(ctx context.Context, repos []config.Repo, out m
 	}
 	return nil
 }
+
+// RulesetSummary identifies a repo's rulesets via the GraphQL list, so the
+// caller can fetch detail in parallel via REST. Replaces the REST list
+// endpoint (`GET /repos/{o}/{r}/rulesets`) and shifts the call to the
+// GraphQL pool, which is otherwise idle for this lane.
+type RulesetSummary struct {
+	ID   int
+	Name string
+}
+
+// FetchRepoRulesetIDs returns the databaseId+name of every repo-level
+// ruleset in one GraphQL call. Bounded at 100 — repos with more than that
+// are unrealistic; if it ever happens, the missing IDs are surfaced via
+// the returned error so the caller can fall back to REST.
+func (c *Client) FetchRepoRulesetIDs(ctx context.Context, prio Priority, repo config.Repo) ([]RulesetSummary, error) {
+	const query = `query($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) {
+    rulesets(first: 100) {
+      nodes { databaseId name }
+      pageInfo { hasNextPage }
+    }
+  }
+}`
+	var resp struct {
+		Repository *struct {
+			Rulesets struct {
+				Nodes []struct {
+					DatabaseID int    `json:"databaseId"`
+					Name       string `json:"name"`
+				} `json:"nodes"`
+				PageInfo struct {
+					HasNextPage bool `json:"hasNextPage"`
+				} `json:"pageInfo"`
+			} `json:"rulesets"`
+		} `json:"repository"`
+	}
+	vars := map[string]any{"owner": repo.Owner, "name": repo.Name}
+	if err := c.DoGraphQL(ctx, prio, repo.Owner, query, vars, &resp); err != nil {
+		return nil, err
+	}
+	if resp.Repository == nil {
+		return nil, nil
+	}
+	nodes := resp.Repository.Rulesets.Nodes
+	out := make([]RulesetSummary, 0, len(nodes))
+	for _, n := range nodes {
+		if n.DatabaseID == 0 {
+			continue
+		}
+		out = append(out, RulesetSummary{ID: n.DatabaseID, Name: n.Name})
+	}
+	if resp.Repository.Rulesets.PageInfo.HasNextPage {
+		return out, fmt.Errorf("ghclient: %s/%s has >100 rulesets; pagination not implemented", repo.Owner, repo.Name)
+	}
+	return out, nil
+}

@@ -5,10 +5,17 @@ import (
 	"fmt"
 	"net/http"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/Depthmark/repositories-settings/internal/config"
 	"github.com/Depthmark/repositories-settings/internal/diff"
 	"github.com/Depthmark/repositories-settings/internal/ghclient"
 )
+
+// rulesetsDetailConcurrency caps in-flight `GET /rulesets/{id}` calls.
+// Five is enough to collapse wall-clock for typical repo sizes (1–20
+// rulesets) without crowding the REST pool when many lanes run concurrently.
+const rulesetsDetailConcurrency = 5
 
 func NewRulesetsLane(cfg *config.RulesetsConfig) Lane {
 	if cfg == nil {
@@ -18,28 +25,36 @@ func NewRulesetsLane(cfg *config.RulesetsConfig) Lane {
 		Resource: "rulesets",
 		Run: func(ctx context.Context, cl *ghclient.Client, repo config.Repo, dryRun bool) ([]diff.Diff, []Result, error) {
 			fetch := func(ctx context.Context) ([]map[string]any, error) {
-				type liveRule struct {
-					ID   int    `json:"id"`
-					Name string `json:"name"`
-				}
-				items, err := ghclient.Paginate[liveRule](ctx, cl, ghclient.PriorityCronReconcile, repo.Owner,
-					fmt.Sprintf("/repos/%s/%s/rulesets", repo.Owner, repo.Name))
+				// List ruleset IDs over GraphQL (1 call, GraphQL pool)
+				// instead of REST list (1 call, REST pool). The detail
+				// fetches still need REST — GraphQL's RepositoryRule
+				// parameters union doesn't round-trip cleanly to the
+				// REST shape that the diff compares against — but they
+				// now run in parallel, so wall-clock is ~RTT regardless
+				// of ruleset count.
+				items, err := cl.FetchRepoRulesetIDs(ctx, ghclient.PriorityCronReconcile, repo)
 				if err != nil {
 					return nil, err
 				}
-				// Fetch each ruleset's full state in parallel.
-				type fullRuleset map[string]any
 				out := make([]map[string]any, len(items))
+				g, gctx := errgroup.WithContext(ctx)
+				g.SetLimit(rulesetsDetailConcurrency)
 				for i, it := range items {
-					var full fullRuleset
-					_, err := cl.DoREST(ctx, ghclient.PriorityCronReconcile, repo.Owner, http.MethodGet,
-						fmt.Sprintf("/repos/%s/%s/rulesets/%d", repo.Owner, repo.Name, it.ID), nil, &full)
-					if err != nil {
-						return nil, err
-					}
-					full["_id"] = it.ID
-					full["name"] = it.Name
-					out[i] = full
+					g.Go(func() error {
+						var full map[string]any
+						_, err := cl.DoREST(gctx, ghclient.PriorityCronReconcile, repo.Owner, http.MethodGet,
+							fmt.Sprintf("/repos/%s/%s/rulesets/%d", repo.Owner, repo.Name, it.ID), nil, &full)
+						if err != nil {
+							return err
+						}
+						full["_id"] = it.ID
+						full["name"] = it.Name
+						out[i] = full
+						return nil
+					})
+				}
+				if err := g.Wait(); err != nil {
+					return nil, err
 				}
 				return out, nil
 			}

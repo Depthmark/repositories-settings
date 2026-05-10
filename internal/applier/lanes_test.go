@@ -184,10 +184,20 @@ func TestRulesetsLane_PlanAndApply(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rec.record(r)
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/rulesets":
-			_ = json.NewEncoder(w).Encode([]map[string]any{
-				{"id": 7, "name": "stay"},
-				{"id": 8, "name": "remove"},
+		case r.Method == http.MethodPost && r.URL.Path == "/graphql":
+			// FetchRepoRulesetIDs replaces the REST list endpoint.
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					"repository": map[string]any{
+						"rulesets": map[string]any{
+							"nodes": []map[string]any{
+								{"databaseId": 7, "name": "stay"},
+								{"databaseId": 8, "name": "remove"},
+							},
+							"pageInfo": map[string]any{"hasNextPage": false},
+						},
+					},
+				},
 			})
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/rulesets/7":
 			_ = json.NewEncoder(w).Encode(map[string]any{
