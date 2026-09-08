@@ -2,14 +2,18 @@ package applier
 
 import (
 	"context"
-	"fmt"
-	"net/http"
+
+	"github.com/google/go-github/v76/github"
 
 	"github.com/Depthmark/repositories-settings/internal/config"
 	"github.com/Depthmark/repositories-settings/internal/diff"
+	"github.com/Depthmark/repositories-settings/internal/ghapi"
 	"github.com/Depthmark/repositories-settings/internal/ghclient"
 )
 
+// Collaborators covers direct grants only. Access inherited from org
+// membership or a team is not this resource's to manage, and listing it
+// would make every reconcile try to revoke it.
 func NewCollaboratorsLane(cfg *config.CollaboratorsConfig) Lane {
 	if cfg == nil {
 		return Lane{}
@@ -18,64 +22,44 @@ func NewCollaboratorsLane(cfg *config.CollaboratorsConfig) Lane {
 		Resource: "collaborators",
 		Run: func(ctx context.Context, cl *ghclient.Client, repo config.Repo, dryRun bool) ([]diff.Diff, []Result, error) {
 			fetch := func(ctx context.Context) ([]map[string]any, error) {
-				type liveColl struct {
-					Login       string `json:"login"`
-					RoleName    string `json:"role_name"`
-					Permissions struct {
-						Admin    bool `json:"admin"`
-						Maintain bool `json:"maintain"`
-						Push     bool `json:"push"`
-						Triage   bool `json:"triage"`
-						Pull     bool `json:"pull"`
-					} `json:"permissions"`
+				var out []*github.User
+				opts := &github.ListCollaboratorsOptions{
+					Affiliation: "direct",
+					ListOptions: github.ListOptions{PerPage: 100},
 				}
-				colls, err := ghclient.Paginate[liveColl](ctx, cl, ghclient.PriorityCronReconcile, repo.Owner,
-					fmt.Sprintf("/repos/%s/%s/collaborators?affiliation=direct", repo.Owner, repo.Name))
-				if err != nil {
-					return nil, err
-				}
-				out := make([]map[string]any, 0, len(colls))
-				for _, c := range colls {
-					perm := c.RoleName
-					if perm == "" {
-						switch {
-						case c.Permissions.Admin:
-							perm = "admin"
-						case c.Permissions.Maintain:
-							perm = "maintain"
-						case c.Permissions.Push:
-							perm = "push"
-						case c.Permissions.Triage:
-							perm = "triage"
-						default:
-							perm = "pull"
-						}
+				for {
+					users, resp, err := cl.GH().Repositories.ListCollaborators(
+						readCtx(ctx, repo, ghapi.RouteCollaborators), repo.Owner, repo.Name, opts)
+					if err != nil {
+						return nil, err
 					}
-					out = append(out, map[string]any{"username": c.Login, "permission": perm})
+					out = append(out, users...)
+					if resp == nil || resp.NextPage == 0 {
+						break
+					}
+					opts.Page = resp.NextPage
 				}
-				return out, nil
+				return mapAll(out, ghapi.DecodeCollaborator), nil
 			}
+
 			desired, err := diff.ToMaps(cfg.Collaborators)
 			if err != nil {
 				return nil, nil, err
 			}
+
 			mutate := func(ctx context.Context, d diff.Diff) (Action, error) {
-				user := stringField(d.Desired, "username")
-				if user == "" {
-					user = stringField(d.Current, "username")
-				}
-				path := fmt.Sprintf("/repos/%s/%s/collaborators/%s", repo.Owner, repo.Name, user)
+				user := keyOf(d, "username")
+				wctx := writeCtx(ctx, repo, ghapi.RouteCollaboratorsUser)
 				switch d.Action {
 				case diff.Create, diff.Update:
-					perm := stringField(d.Desired, "permission")
-					_, err := cl.DoREST(ctx, ghclient.PriorityMergeApply, repo.Owner, http.MethodPut, path,
-						map[string]any{"permission": perm}, nil)
+					_, _, err := cl.GH().Repositories.AddCollaborator(wctx, repo.Owner, repo.Name, user,
+						&github.RepositoryAddCollaboratorOptions{Permission: stringField(d.Desired, "permission")})
 					if d.Action == diff.Create {
 						return Created, err
 					}
 					return Updated, err
 				case diff.Delete:
-					_, err := cl.DoREST(ctx, ghclient.PriorityMergeApply, repo.Owner, http.MethodDelete, path, nil, nil)
+					_, err := cl.GH().Repositories.RemoveCollaborator(wctx, repo.Owner, repo.Name, user)
 					return Deleted, err
 				}
 				return Skipped, nil

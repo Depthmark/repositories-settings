@@ -33,7 +33,12 @@ func chain(mw ...func(http.Handler) http.Handler) func(http.Handler) http.Handle
 func traceMiddleware() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			id := r.Header.Get("X-Request-ID")
+			// A caller-supplied trace ID is echoed into a response
+			// header and into every log line for the request, so it is
+			// only honoured in a shape that cannot forge either: no
+			// newlines to inject a log record, nothing to break out of
+			// the header.
+			id := sanitizeTraceID(r.Header.Get("X-Request-ID"))
 			if id == "" {
 				id = logger.TraceID()
 			}
@@ -42,6 +47,27 @@ func traceMiddleware() func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
+}
+
+// maxTraceIDLen bounds a caller-supplied trace ID.
+const maxTraceIDLen = 64
+
+// sanitizeTraceID returns id when it is a short run of characters safe
+// in a header and a log line, and "" otherwise. Rejecting rather than
+// stripping keeps a mangled ID from being correlated with the real one.
+func sanitizeTraceID(id string) string {
+	if id == "" || len(id) > maxTraceIDLen {
+		return ""
+	}
+	for _, c := range id {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '-', c == '_':
+		default:
+			return ""
+		}
+	}
+	return id
 }
 
 func accessLogMiddleware(log *slog.Logger) func(http.Handler) http.Handler {
@@ -97,4 +123,16 @@ type statusRecorder struct {
 func (r *statusRecorder) WriteHeader(s int) {
 	r.status = s
 	r.ResponseWriter.WriteHeader(s)
+}
+
+// limitBody caps how much a handler can read from the request body.
+// http.MaxBytesReader makes the read fail once the cap is exceeded and
+// signals the client with a 413 rather than letting a handler buffer an
+// arbitrarily large payload. Applied per-route because the webhook and
+// the API endpoints have different sized legitimate payloads.
+func limitBody(n int64, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, n)
+		next.ServeHTTP(w, r)
+	})
 }

@@ -97,6 +97,15 @@ func ValidateEnvironmentsFile(f *EnvironmentsFile) error {
 		if len(e.Reviewers) > 6 {
 			v.add("environments[%d].reviewers: max 6", i)
 		}
+		if len(e.Variables) > 0 {
+			v.add("environments[%d].variables: not supported yet — environment variables are not applied by this service; declare them under variables.yml or remove the key", i)
+		}
+		if len(e.Secrets) > 0 {
+			v.add("environments[%d].secrets: not supported yet — environment secrets are not applied by this service; remove the key", i)
+		}
+		if p := e.DeploymentBranchPolicy; p != nil && len(p.BranchPolicies) > 0 {
+			v.add("environments[%d].deployment_branch_policy.branch_policies: not supported yet — named branch policies are not applied; set custom_branch_policies and add the patterns in the GitHub UI, or remove the key", i)
+		}
 	}
 	return finalize(v)
 }
@@ -116,11 +125,14 @@ func ValidateWebhooksFile(f *WebhooksFile) error {
 			_ = u
 			v.add("webhooks[%d].url: must be a valid http(s) URL", i)
 		}
-		if w.ContentType != "" && !oneOf(w.ContentType, "json", "form") {
-			v.add("webhooks[%d].content_type: invalid value %q", i, w.ContentType)
+		if w.ContentType != nil && !oneOf(*w.ContentType, "json", "form") {
+			v.add("webhooks[%d].content_type: invalid value %q", i, *w.ContentType)
 		}
-		if len(w.Events) == 0 {
-			v.add("webhooks[%d].events: at least one event required", i)
+		if w.Events != nil && len(w.Events) == 0 {
+			v.add("webhooks[%d].events: at least one event required (omit the key to leave events unmanaged)", i)
+		}
+		if w.SecretRef != "" {
+			v.add("webhooks[%d].secret_ref: not supported yet — the webhook secret is not applied by this service; remove the key or set the secret manually", i)
 		}
 	}
 	return finalize(v)
@@ -217,8 +229,11 @@ func ValidateDeployKeysFile(f *DeployKeysFile) error {
 		if k.Title == "" {
 			v.add("deploy_keys[%d].title: required", i)
 		}
+		if k.KeyRef != "" {
+			v.add("deploy_keys[%d].key_ref: not supported yet — this service has no secret store to resolve a reference against; inline the public key under `key`, or add the key in the GitHub UI", i)
+		}
 		if k.Key == "" && k.KeyRef == "" {
-			v.add("deploy_keys[%d]: either key or key_ref must be set", i)
+			v.add("deploy_keys[%d]: `key` is required — the public key is what gets uploaded", i)
 		}
 	}
 	return finalize(v)

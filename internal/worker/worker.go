@@ -37,12 +37,12 @@ func New(rec *reconciler.Reconciler, cl *ghclient.Client, logger *slog.Logger) *
 }
 
 // ReconcileBatch processes the given repos. settingsFor returns each
-// repo's pre-resolved Settings (org+suborg+repo merged); the worker is
-// agnostic to where they come from.
+// repo's resolved configuration (org + suborg + repo, plus the policy
+// verdict); the worker is agnostic to where it comes from.
 func (w *Worker) ReconcileBatch(
 	ctx context.Context,
 	repos []config.Repo,
-	settingsFor func(config.Repo) (*config.Settings, error),
+	settingsFor func(config.Repo) (*config.Resolution, error),
 	dryRun bool,
 ) []*reconciler.Report {
 	if len(repos) == 0 {
@@ -102,10 +102,10 @@ func (w *Worker) runOne(
 	ctx context.Context,
 	repo config.Repo,
 	prefetched map[string]ghclient.BatchedRepoState,
-	settingsFor func(config.Repo) (*config.Settings, error),
+	settingsFor func(config.Repo) (*config.Resolution, error),
 	dryRun bool,
 ) (*reconciler.Report, error) {
-	settings, err := settingsFor(repo)
+	res, err := settingsFor(repo)
 	if err != nil {
 		return nil, err
 	}
@@ -125,15 +125,11 @@ func (w *Worker) runOne(
 					HasDiscussions: state.HasDiscussions,
 					IsTemplate:     state.IsTemplate,
 					Topics:         state.Topics,
+					TopicsComplete: state.TopicsComplete,
 				},
 			}
 		}
 	}
 
-	var rep *reconciler.Report
-	var runErr error
-	w.cl.RepoLock().With(repo.Owner, repo.Name, func() {
-		rep, runErr = w.rec.Reconcile(ctx, w.cl, repo, settings, config.TriggerCron, dryRun, pf)
-	})
-	return rep, runErr
+	return w.rec.Reconcile(ctx, w.cl, repo, res, config.TriggerCron, dryRun, pf)
 }

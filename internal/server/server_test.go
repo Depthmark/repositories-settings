@@ -81,6 +81,11 @@ func TestValidateHandler_BadYAML(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/validate", bytes.NewReader(b))
 	rr := httptest.NewRecorder()
 	s.httpSrv.Handler.ServeHTTP(rr, req)
+	// A schema failure is unprocessable content, not a successful
+	// validation of an invalid file: the workflow branches on this.
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422: %s", rr.Code, rr.Body.String())
+	}
 	var resp validateResponse
 	_ = json.Unmarshal(rr.Body.Bytes(), &resp)
 	if resp.Valid {
@@ -160,6 +165,64 @@ func TestReconcileHandler_Auth(t *testing.T) {
 	}
 }
 
+func TestPrivilegedIngress_FailsClosedWithoutCredentials(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		body   string
+	}{
+		{name: "reconcile", method: http.MethodPost, path: "/api/reconcile", body: `{}`},
+		{name: "check", method: http.MethodPost, path: "/api/check", body: `{}`},
+		{name: "webhook", method: http.MethodPost, path: "/webhook", body: `{}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := New(":0", Deps{Logger: logger.Discard()})
+			req := httptest.NewRequest(tt.method, tt.path, strings.NewReader(tt.body))
+			rr := httptest.NewRecorder()
+			s.httpSrv.Handler.ServeHTTP(rr, req)
+			if rr.Code != http.StatusUnauthorized {
+				t.Fatalf("expected 401, got %d: %s", rr.Code, rr.Body.String())
+			}
+		})
+	}
+}
+
+func TestAuthorize_RequiresExactBearerOrExplicitDevOptIn(t *testing.T) {
+	allowed := func(d Deps, bearer string) bool {
+		req := httptest.NewRequest(http.MethodPost, "/api/reconcile", nil)
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		_, ok := authorize(req, d)
+		return ok
+	}
+
+	if allowed(Deps{Logger: logger.Discard()}, "") {
+		t.Fatal("empty API token authorized without explicit dev opt-in")
+	}
+	if !allowed(Deps{Logger: logger.Discard(), AllowUnauthenticated: true}, "") {
+		t.Fatal("explicit dev opt-in did not authorize request")
+	}
+
+	withToken := Deps{Logger: logger.Discard(), APIToken: "topsecret"}
+	if !allowed(withToken, "topsecret") {
+		t.Fatal("exact bearer token rejected")
+	}
+	if allowed(withToken, "topsecret-extra") {
+		t.Fatal("non-exact bearer token authorized")
+	}
+	if allowed(withToken, "") {
+		t.Fatal("missing bearer authorized against a configured token")
+	}
+	// A configured token is not a fallback for a dev opt-in: the opt-in
+	// only covers the case where no credential is configured at all.
+	if allowed(Deps{Logger: logger.Discard(), APIToken: "topsecret", AllowUnauthenticated: true}, "wrong") {
+		t.Fatal("dev opt-in let a wrong token through")
+	}
+}
+
 func TestWebhook_RejectsBadSig(t *testing.T) {
 	s := New(":0", Deps{Logger: logger.Discard(), WebhookSecret: []byte("s")})
 	req := httptest.NewRequest(http.MethodPost, "/webhook", io.NopCloser(strings.NewReader("{}")))
@@ -169,5 +232,43 @@ func TestWebhook_RejectsBadSig(t *testing.T) {
 	s.httpSrv.Handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", rr.Code)
+	}
+}
+
+// A caller-supplied trace ID is echoed into a response header and into
+// every log line for the request. Only a bounded, plain-token shape is
+// honoured, so neither surface can be forged.
+func TestTraceMiddleware_RejectsUnsafeRequestIDs(t *testing.T) {
+	s := New(":0", Deps{Logger: logger.Discard()})
+
+	t.Run("a plain token is preserved", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+		req.Header.Set("X-Request-ID", "abc-123_XYZ")
+		rr := httptest.NewRecorder()
+		s.httpSrv.Handler.ServeHTTP(rr, req)
+		if got := rr.Header().Get("X-Request-ID"); got != "abc-123_XYZ" {
+			t.Fatalf("X-Request-ID = %q, want it preserved", got)
+		}
+	})
+
+	for _, bad := range []string{
+		"has space",
+		"line\nbreak",
+		"semi;colon",
+		strings.Repeat("a", 65),
+	} {
+		t.Run("rejected: "+bad[:min(len(bad), 12)], func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+			req.Header.Set("X-Request-ID", bad)
+			rr := httptest.NewRecorder()
+			s.httpSrv.Handler.ServeHTTP(rr, req)
+			got := rr.Header().Get("X-Request-ID")
+			if got == bad {
+				t.Fatalf("unsafe X-Request-ID %q was echoed back", bad)
+			}
+			if got == "" {
+				t.Fatal("a generated trace ID should have replaced it")
+			}
+		})
 	}
 }

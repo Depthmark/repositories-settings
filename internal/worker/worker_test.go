@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Depthmark/repositories-settings/internal/config"
 	"github.com/Depthmark/repositories-settings/internal/ghclient"
@@ -84,7 +85,7 @@ func TestReconcileBatch_PartitionsAndPrefetchesPerBatch(t *testing.T) {
 	w.Concurrency = 8
 
 	repos := makeRepos(120)
-	settings := func(_ config.Repo) (*config.Settings, error) { return &config.Settings{}, nil }
+	settings := func(_ config.Repo) (*config.Resolution, error) { return config.RepoOnly(nil), nil }
 	reports := w.ReconcileBatch(context.Background(), repos, settings, true)
 
 	if len(reports) != 120 {
@@ -105,7 +106,7 @@ func TestReconcileBatch_EmptyInput(t *testing.T) {
 	rec := reconciler.New(logger.Discard())
 	w := New(rec, cl, logger.Discard())
 
-	settings := func(_ config.Repo) (*config.Settings, error) { return &config.Settings{}, nil }
+	settings := func(_ config.Repo) (*config.Resolution, error) { return config.RepoOnly(nil), nil }
 	if reports := w.ReconcileBatch(context.Background(), nil, settings, true); reports != nil {
 		t.Fatalf("expected nil reports, got %d", len(reports))
 	}
@@ -133,24 +134,50 @@ func TestReconcileBatch_PrefetchFailureTolerated(t *testing.T) {
 	w := New(rec, cl, logger.Discard())
 
 	repos := makeRepos(5)
-	settings := func(_ config.Repo) (*config.Settings, error) { return &config.Settings{}, nil }
+	settings := func(_ config.Repo) (*config.Resolution, error) { return config.RepoOnly(nil), nil }
 	reports := w.ReconcileBatch(context.Background(), repos, settings, true)
 	if len(reports) != 5 {
 		t.Fatalf("expected 5 reports despite prefetch failure, got %d", len(reports))
 	}
 }
 
-// runOne acquires the per-repo lock so that two concurrent reconciles
-// against the same repo never overlap. This is the contract the worker
-// relies on to avoid duplicate writes.
+// Reconciler.Reconcile holds the per-repo lock so two worker runs
+// against the same repository never overlap. The observation has to be
+// made inside the lock: settings are resolved before it is taken, so
+// counting concurrency there measures nothing.
 func TestReconcileBatch_PerRepoLockSerializes(t *testing.T) {
-	srv, _ := fakeGraphQLServer(t)
+	var inFlight, maxObserved int32
+	released := make(chan struct{})
+	var releaseOnce sync.Once
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/o/shared" {
+			http.NotFound(w, r)
+			return
+		}
+		n := atomic.AddInt32(&inFlight, 1)
+		for {
+			cur := atomic.LoadInt32(&maxObserved)
+			if n <= cur || atomic.CompareAndSwapInt32(&maxObserved, cur, n) {
+				break
+			}
+		}
+		// Hold the first reader open long enough that a second one would
+		// overlap if the lock were not doing its job. Every reader waits
+		// on the same channel, so the test does not serialise itself.
+		releaseOnce.Do(func() {
+			time.AfterFunc(50*time.Millisecond, func() { close(released) })
+		})
+		<-released
+		atomic.AddInt32(&inFlight, -1)
+		_ = json.NewEncoder(w).Encode(map[string]any{"description": "live"})
+	}))
 	defer srv.Close()
+
 	cl, rl := newTestClient(srv)
 	defer rl.Stop()
 
-	rec := reconciler.New(logger.Discard())
-	w := New(rec, cl, logger.Discard())
+	w := New(reconciler.New(logger.Discard()), cl, logger.Discard())
 	w.Concurrency = 8
 
 	const sameRepoCopies = 4
@@ -159,25 +186,13 @@ func TestReconcileBatch_PerRepoLockSerializes(t *testing.T) {
 		repos[i] = config.Repo{Owner: "o", Name: "shared"}
 	}
 
-	// settingsFor blocks until released so we can observe whether two
-	// reconciles for the same repo run concurrently. With the lock,
-	// only one can be inside settingsFor at a time.
-	var inFlight int32
-	var maxObserved int32
-	gate := make(chan struct{})
-	var releaseOnce sync.Once
-	settings := func(_ config.Repo) (*config.Settings, error) {
-		n := atomic.AddInt32(&inFlight, 1)
-		for {
-			cur := atomic.LoadInt32(&maxObserved)
-			if n <= cur || atomic.CompareAndSwapInt32(&maxObserved, cur, n) {
-				break
-			}
-		}
-		releaseOnce.Do(func() { close(gate) })
-		<-gate
-		atomic.AddInt32(&inFlight, -1)
-		return &config.Settings{}, nil
+	// A repo config makes Phase A read live state, which is the call the
+	// fake server counts.
+	desc := "live"
+	settings := func(_ config.Repo) (*config.Resolution, error) {
+		return config.RepoOnly(&config.Settings{
+			Repo: &config.RepoConfig{Description: &desc},
+		}), nil
 	}
 
 	reports := w.ReconcileBatch(context.Background(), repos, settings, true)
@@ -185,6 +200,6 @@ func TestReconcileBatch_PerRepoLockSerializes(t *testing.T) {
 		t.Fatalf("got %d reports, want %d", len(reports), sameRepoCopies)
 	}
 	if got := atomic.LoadInt32(&maxObserved); got != 1 {
-		t.Fatalf("max concurrent reconciles for same repo = %d, want 1 (lock should serialize)", got)
+		t.Fatalf("max concurrent reads for one repo = %d, want 1 (the lock should serialize them)", got)
 	}
 }

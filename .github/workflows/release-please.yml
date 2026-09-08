@@ -17,11 +17,11 @@ jobs:
     name: Release Please
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      pull-requests: write
-      id-token: write
+      contents: write       # Create release commits, tags, and GitHub releases
+      pull-requests: write  # Open and update the release pull request
+      id-token: write       # Exchange this workflow's identity for an App token
     steps:
-      - uses: Depthmark/github-sts-action@66fb1a28c2f57b75b39ae7dfdfb72a44bb8836ea # main
+      - uses: Depthmark/github-sts-action@9014c80f47cad81e0a1295b112714d5c1b219d54 # v0.3.0
         id: sts
         with:
           sts-url: https://github-sts-dev.adelisle.com

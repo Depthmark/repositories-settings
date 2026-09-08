@@ -3,8 +3,9 @@
 //
 // Routes are registered on a stdlib net/http.ServeMux. Middleware order
 // (outer-most first): trace ID, access log, metrics. Webhooks add HMAC
-// verification. The /api routes accept either an HMAC-signed Bearer token
-// or the same webhook secret as a Bearer for simplicity.
+// verification. The privileged /api routes require a Bearer credential:
+// either a GitHub Actions OIDC token, which binds the caller to its own
+// repository, or the static operator token, which does not.
 package server
 
 import (
@@ -19,8 +20,25 @@ import (
 	"github.com/Depthmark/repositories-settings/internal/config"
 	"github.com/Depthmark/repositories-settings/internal/ghclient"
 	"github.com/Depthmark/repositories-settings/internal/metrics"
+	"github.com/Depthmark/repositories-settings/internal/oidc"
 	"github.com/Depthmark/repositories-settings/internal/reconciler"
 	"github.com/prometheus/client_golang/prometheus"
+)
+
+// Request-hardening limits. The webhook body cap matches GitHub's own
+// payload ceiling; the API cap is deliberately tighter because
+// /api/validate is unauthenticated and parses whatever it is handed.
+//
+// WriteTimeout is generous because reconciles still run inline on the
+// request goroutine; it exists to bound a stuck connection, not to
+// police handler latency. It can drop sharply once intake is async.
+const (
+	MaxWebhookBody = 5 << 20 // 5 MiB
+	MaxAPIBody     = 1 << 20 // 1 MiB
+	MaxHeaderBytes = 1 << 20 // 1 MiB
+	ReadTimeout    = 30 * time.Second
+	WriteTimeout   = 5 * time.Minute
+	IdleTimeout    = 90 * time.Second
 )
 
 // Deps bundles handler dependencies.
@@ -30,8 +48,20 @@ type Deps struct {
 	Reconciler    *reconciler.Reconciler
 	WebhookSecret []byte
 	APIToken      string
-	Registry      *prometheus.Registry
-	Settings      func(ctx context.Context, repo config.Repo, ref string) (*config.Settings, error)
+	// OIDC verifies GitHub Actions workflow tokens on the privileged API
+	// routes. Nil disables the mode, leaving the static APIToken as the
+	// only credential. When set, a caller is bound to the repository its
+	// token names; see internal/server/auth.go.
+	OIDC *oidc.Verifier
+	// AllowUnauthenticated is an explicit development-only escape hatch.
+	// Production defaults fail closed when either ingress credential is empty.
+	AllowUnauthenticated bool
+	Registry             *prometheus.Registry
+	// Settings resolves a repository's desired state: the org layer, any
+	// suborg tiers, the repository's own files, and the policy verdict on
+	// the result. Handlers hand the whole resolution to the reconciler so
+	// policy is enforced on every trigger, not per call site.
+	Settings func(ctx context.Context, repo config.Repo, ref string) (*config.Resolution, error)
 	// AppSlug is the GitHub App's URL slug (e.g. "repo-settings"); used
 	// to recognise mentions in PR comments. Falls back to "repo-settings".
 	AppSlug string
@@ -60,10 +90,10 @@ func New(addr string, d Deps) *Server {
 		mux.Handle("GET /metrics", metrics.Handler(d.Registry))
 	}
 
-	mux.Handle("POST /webhook", &webhookHandler{deps: d})
-	mux.Handle("POST /api/reconcile", &reconcileHandler{deps: d})
-	mux.Handle("POST /api/validate", &validateHandler{deps: d})
-	mux.Handle("POST /api/check", &checkHandler{deps: d})
+	mux.Handle("POST /webhook", limitBody(MaxWebhookBody, &webhookHandler{deps: d}))
+	mux.Handle("POST /api/reconcile", limitBody(MaxAPIBody, &reconcileHandler{deps: d}))
+	mux.Handle("POST /api/validate", limitBody(MaxAPIBody, &validateHandler{deps: d}))
+	mux.Handle("POST /api/check", limitBody(MaxAPIBody, &checkHandler{deps: d}))
 
 	wrapped := chain(
 		traceMiddleware(),
@@ -75,6 +105,10 @@ func New(addr string, d Deps) *Server {
 			Addr:              addr,
 			Handler:           wrapped,
 			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       ReadTimeout,
+			WriteTimeout:      WriteTimeout,
+			IdleTimeout:       IdleTimeout,
+			MaxHeaderBytes:    MaxHeaderBytes,
 		},
 		ready:  ready,
 		logger: d.Logger,

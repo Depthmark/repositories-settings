@@ -33,8 +33,19 @@ go.work.sum
 .aidlc-rule-details/
 aidlc-docs/
 
-# Claude Code
+# Local agent instructions, configuration, and task artifacts
+AGENTS.md
+AGENTS.local.md
+AGENTS.override.md
+CLAUDE.md
+CLAUDE.local.md
+.agents/
+.agents-*/
+.codex/
 .claude/
 
 # Local validation
 validation_local/
+
+# Local scripts
+/scripts/

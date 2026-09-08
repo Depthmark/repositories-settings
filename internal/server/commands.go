@@ -20,8 +20,8 @@ const (
 // privilegedCommands require write access. Comparisons are against the
 // payload's `author_association`. GitHub guarantees these strings.
 var privilegedAssociations = map[string]bool{
-	"OWNER":       true,
-	"MEMBER":      true,
+	"OWNER":        true,
+	"MEMBER":       true,
 	"COLLABORATOR": true,
 }
 

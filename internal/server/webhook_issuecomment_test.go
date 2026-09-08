@@ -52,8 +52,8 @@ func newGHStub(t *testing.T) *ghStub {
 	return g
 }
 
-func (g *ghStub) close()                     { g.srv.Close() }
-func (g *ghStub) requests() []recordedReq    { return append([]recordedReq(nil), g.reqs...) }
+func (g *ghStub) close()                  { g.srv.Close() }
+func (g *ghStub) requests() []recordedReq { return append([]recordedReq(nil), g.reqs...) }
 func (g *ghStub) count(method, path string) int {
 	n := 0
 	for _, r := range g.reqs {
@@ -64,7 +64,7 @@ func (g *ghStub) count(method, path string) int {
 	return n
 }
 
-func newServer(t *testing.T, gh *ghStub, settings func(context.Context, config.Repo, string) (*config.Settings, error)) *Server {
+func newServer(t *testing.T, gh *ghStub, settings func(context.Context, config.Repo, string) (*config.Resolution, error)) *Server {
 	t.Helper()
 	rl := ghclient.NewRateLimiter(logger.Discard(), ghclient.Options{Concurrency: 4})
 	t.Cleanup(rl.Stop)
@@ -72,11 +72,12 @@ func newServer(t *testing.T, gh *ghStub, settings func(context.Context, config.R
 		APIURL: gh.srv.URL, Limiter: rl, HTTPClient: gh.srv.Client(), Logger: logger.Discard(),
 	})
 	return New(":0", Deps{
-		Logger:     logger.Discard(),
-		Client:     cl,
-		Reconciler: reconciler.New(logger.Discard()),
-		AppSlug:    "repo-settings",
-		Settings:   settings,
+		Logger:               logger.Discard(),
+		Client:               cl,
+		Reconciler:           reconciler.New(logger.Discard()),
+		AllowUnauthenticated: true,
+		AppSlug:              "repo-settings",
+		Settings:             settings,
 	})
 }
 
@@ -93,8 +94,8 @@ func postWebhook(s *Server, event, payload string) *httptest.ResponseRecorder {
 func TestWebhook_IssueComment_RecheckPostsSticky(t *testing.T) {
 	gh := newGHStub(t)
 	defer gh.close()
-	settings := func(_ context.Context, _ config.Repo, _ string) (*config.Settings, error) {
-		return &config.Settings{}, nil
+	settings := func(_ context.Context, _ config.Repo, _ string) (*config.Resolution, error) {
+		return config.RepoOnly(nil), nil
 	}
 	s := newServer(t, gh, settings)
 
@@ -118,9 +119,9 @@ func TestWebhook_IssueComment_ApplyRequiresWriteAccess(t *testing.T) {
 	defer gh.close()
 
 	var reconciled int32
-	settings := func(_ context.Context, _ config.Repo, _ string) (*config.Settings, error) {
+	settings := func(_ context.Context, _ config.Repo, _ string) (*config.Resolution, error) {
 		atomic.AddInt32(&reconciled, 1)
-		return &config.Settings{}, nil
+		return config.RepoOnly(nil), nil
 	}
 	s := newServer(t, gh, settings)
 
@@ -142,8 +143,8 @@ func TestWebhook_IssueComment_ApplyRequiresWriteAccess(t *testing.T) {
 func TestWebhook_IssueComment_IgnoresBotAuthor(t *testing.T) {
 	gh := newGHStub(t)
 	defer gh.close()
-	settings := func(_ context.Context, _ config.Repo, _ string) (*config.Settings, error) {
-		return &config.Settings{}, nil
+	settings := func(_ context.Context, _ config.Repo, _ string) (*config.Resolution, error) {
+		return config.RepoOnly(nil), nil
 	}
 	s := newServer(t, gh, settings)
 
@@ -169,7 +170,7 @@ func TestWebhook_IssueComment_IgnoresBotAuthor(t *testing.T) {
 func TestWebhook_PullRequest_ConfigErrorPostsComment(t *testing.T) {
 	gh := newGHStub(t)
 	defer gh.close()
-	settings := func(_ context.Context, _ config.Repo, _ string) (*config.Settings, error) {
+	settings := func(_ context.Context, _ config.Repo, _ string) (*config.Resolution, error) {
 		return nil, &config.ValidationError{File: "teams.yml", Issues: []string{"missing required field 'slug'"}}
 	}
 	s := newServer(t, gh, settings)
@@ -204,8 +205,8 @@ func TestWebhook_PullRequest_ConfigErrorPostsComment(t *testing.T) {
 func TestWebhook_IssueComment_HelpOnBareMention(t *testing.T) {
 	gh := newGHStub(t)
 	defer gh.close()
-	settings := func(_ context.Context, _ config.Repo, _ string) (*config.Settings, error) {
-		return &config.Settings{}, nil
+	settings := func(_ context.Context, _ config.Repo, _ string) (*config.Resolution, error) {
+		return config.RepoOnly(nil), nil
 	}
 	s := newServer(t, gh, settings)
 	// Trigger on its own line with no verb → help. Casual mentions

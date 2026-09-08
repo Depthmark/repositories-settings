@@ -100,7 +100,7 @@ func TestReconcile_PhaseAUpdatesRepoAndTopics(t *testing.T) {
 		},
 	}
 
-	rep, err := r.Reconcile(context.Background(), cl, config.Repo{Owner: "o", Name: "r"}, settings, config.TriggerManual, false, nil)
+	rep, err := r.Reconcile(context.Background(), cl, config.Repo{Owner: "o", Name: "r"}, config.RepoOnly(settings), config.TriggerManual, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +143,7 @@ func TestReconcile_DryRunSkipsApply(t *testing.T) {
 	r := New(logger.Discard())
 	desc := "x"
 	rep, err := r.Reconcile(context.Background(), cl, config.Repo{Owner: "o", Name: "r"},
-		&config.Settings{Repo: &config.RepoConfig{Description: &desc}}, config.TriggerManual, true, nil)
+		config.RepoOnly(&config.Settings{Repo: &config.RepoConfig{Description: &desc}}), config.TriggerManual, true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,6 +155,58 @@ func TestReconcile_DryRunSkipsApply(t *testing.T) {
 	}
 	if len(rep.Applied) != 0 {
 		t.Fatalf("dry-run produced apply results: %+v", rep.Applied)
+	}
+}
+
+func TestReconcile_SerializesSameRepository(t *testing.T) {
+	var (
+		inFlight atomic.Int32
+		maxSeen  atomic.Int32
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		n := inFlight.Add(1)
+		for {
+			old := maxSeen.Load()
+			if n <= old || maxSeen.CompareAndSwap(old, n) {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+		inFlight.Add(-1)
+		_ = json.NewEncoder(w).Encode(map[string]any{"description": "live"})
+	}))
+	defer srv.Close()
+
+	rl := ghclient.NewRateLimiter(logger.Discard(), ghclient.Options{Concurrency: 10})
+	defer rl.Stop()
+	cl := ghclient.New(ghclient.Config{
+		APIURL: srv.URL, Limiter: rl, HTTPClient: srv.Client(), Logger: logger.Discard(),
+	})
+	r := New(logger.Discard())
+	repo := config.Repo{Owner: "o", Name: "r"}
+	res := config.RepoOnly(&config.Settings{
+		Repo: &config.RepoConfig{Description: config.Ptr("live")},
+	})
+
+	errCh := make(chan error, 4)
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := r.Reconcile(context.Background(), cl, repo, res, config.TriggerManual, true, nil)
+			errCh <- err
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("Reconcile() error = %v", err)
+		}
+	}
+	if got := maxSeen.Load(); got != 1 {
+		t.Fatalf("max concurrent GitHub calls for one repo = %d, want 1", got)
 	}
 }
 
@@ -196,7 +248,7 @@ func TestReconcile_DisabledLanesAreSkippedNotApplied(t *testing.T) {
 	disabled, _ := config.ParseDisabledResources("pages,secrets")
 	r := New(logger.Discard()).WithDisabled(disabled)
 	rep, err := r.Reconcile(context.Background(), cl,
-		config.Repo{Owner: "o", Name: "r"}, settings, config.TriggerManual, false, nil)
+		config.Repo{Owner: "o", Name: "r"}, config.RepoOnly(settings), config.TriggerManual, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,7 +299,7 @@ func TestReconcile_DisabledButUnconfiguredEmitsNothing(t *testing.T) {
 	disabled, _ := config.ParseDisabledResources("pages,secrets,deploy_keys")
 	r := New(logger.Discard()).WithDisabled(disabled)
 	rep, err := r.Reconcile(context.Background(), cl,
-		config.Repo{Owner: "o", Name: "r"}, &config.Settings{}, config.TriggerManual, false, nil)
+		config.Repo{Owner: "o", Name: "r"}, config.RepoOnly(&config.Settings{}), config.TriggerManual, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -279,7 +331,7 @@ func TestReconcile_LaneFailureIsolated(t *testing.T) {
 	})
 	r := New(logger.Discard())
 	rep, err := r.Reconcile(context.Background(), cl, config.Repo{Owner: "o", Name: "r"},
-		&config.Settings{Teams: &config.TeamsConfig{Teams: []config.TeamAccess{{Slug: "p", Permission: "push"}}}},
+		config.RepoOnly(&config.Settings{Teams: &config.TeamsConfig{Teams: []config.TeamAccess{{Slug: "p", Permission: "push"}}}}),
 		config.TriggerManual, false, nil)
 	if err != nil {
 		t.Fatal(err)

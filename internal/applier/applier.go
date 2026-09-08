@@ -17,7 +17,18 @@ import (
 	"github.com/Depthmark/repositories-settings/internal/ghclient"
 )
 
-// Action names match the TS ApplyResult shape: created/updated/deleted/skipped.
+// Action is what a lane did, or would do, to one resource.
+//
+// Skipped and Pending are both non-failures, and they mean different
+// things:
+//
+//	Skipped — the operator disabled this resource on this deployment.
+//	Pending — the configuration is correct and there is simply nothing
+//	          for this service to do yet, because the value lives in
+//	          another system. A declared secret whose value has not been
+//	          uploaded is the canonical case: that is the normal steady
+//	          state of every repo using the feature, so reporting it as
+//	          an error turned those repos' PR checks permanently red.
 type Action string
 
 const (
@@ -25,9 +36,15 @@ const (
 	Updated Action = "updated"
 	Deleted Action = "deleted"
 	Skipped Action = "skipped"
+	Pending Action = "pending"
 )
 
 // Result is one mutation outcome.
+//
+// Error carries the explanation for any non-applied outcome, not only
+// failures: it is also where a Skipped lane's policy reason and a
+// Pending resource's "waiting on" message live, so every surface
+// renders them the same way.
 type Result struct {
 	Resource     string `json:"resource"`
 	Action       Action `json:"action"`
@@ -47,6 +64,13 @@ type Lane struct {
 // success is a small helper for building successful Result values.
 func success(resource string, a Action, calls int) Result {
 	return Result{Resource: resource, Action: a, Success: true, APICallsUsed: calls}
+}
+
+// pending records a resource this service cannot act on yet. It is a
+// success: nothing is wrong, and nothing is expected to change until
+// the external value appears.
+func pending(resource, reason string) Result {
+	return Result{Resource: resource, Action: Pending, Success: true, Error: reason}
 }
 
 func failure(resource string, a Action, err error, calls int) Result {

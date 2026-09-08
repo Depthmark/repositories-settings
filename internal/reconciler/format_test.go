@@ -14,7 +14,7 @@ func TestFormatReportMarkdown_NoChanges(t *testing.T) {
 	out := FormatReportMarkdown(&Report{DryRun: true})
 	for _, want := range []string{
 		"repo-settings — no changes",
-		"## What's changing",
+		"<summary>What's changing</summary>",
 		"No resources to inspect",
 	} {
 		if !strings.Contains(out, want) {
@@ -48,7 +48,7 @@ func TestFormatReportMarkdown_VerdictDryRunReadyToApply(t *testing.T) {
 	for _, want := range []string{
 		"## :large_blue_circle: repo-settings — 3 change(s) ready to apply",
 		"**1 add · 1 modify · 1 remove**",
-		"## What's changing",
+		"<summary>What's changing</summary>",
 		"Comment `apply`",
 	} {
 		if !strings.Contains(out, want) {
@@ -97,11 +97,11 @@ func TestFormatReportMarkdown_VerdictBlockedShowsErrorsFirst(t *testing.T) {
 	out := FormatReportMarkdown(rep)
 	for _, want := range []string{
 		"## :rotating_light: repo-settings — blocked (2 error(s))",
-		"## :no_entry: Errors",
+		"<summary>:no_entry: 2 error(s) — these block the apply</summary>",
 		"`secrets.MY_TOKEN`",
 		"`pages`",
 		"permission denied",
-		"## What's changing",
+		"<summary>What's changing</summary>",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output missing %q:\n%s", want, out)
@@ -109,9 +109,9 @@ func TestFormatReportMarkdown_VerdictBlockedShowsErrorsFirst(t *testing.T) {
 	}
 
 	// Errors must precede diff.
-	errIdx := strings.Index(out, "## :no_entry: Errors")
-	diffIdx := strings.Index(out, "## What's changing")
-	if !(errIdx > 0 && errIdx < diffIdx) {
+	errIdx := strings.Index(out, "<summary>:no_entry: 2 error(s) — these block the apply</summary>")
+	diffIdx := strings.Index(out, "<summary>What's changing</summary>")
+	if errIdx <= 0 || errIdx >= diffIdx {
 		t.Fatalf("Errors must precede diff: errIdx=%d diffIdx=%d\n%s", errIdx, diffIdx, out)
 	}
 
@@ -161,12 +161,12 @@ func TestFormatReportMarkdown_NilSafe(t *testing.T) {
 	}
 }
 
-// Operator-disabled lanes go into a collapsed <details> section
-// AFTER the diff — they are informational, not actionable, and
-// shouldn't compete with real changes for top-of-fold real estate.
-// The verdict line still surfaces the count so the reader knows
-// something is being skipped.
-func TestFormatReportMarkdown_SkippedAfterDiffAndCollapsed(t *testing.T) {
+// Operator-disabled lanes render in a <details open> section ABOVE
+// the diff. Silently ignoring a section the repo configured is
+// exactly the failure this section exists to surface, so it must not
+// compete for attention below the fold. The verdict line still
+// carries the count.
+func TestFormatReportMarkdown_SkippedAboveDiffAndOpen(t *testing.T) {
 	rep := &Report{
 		DryRun: true,
 		Diffs: []diff.Diff{
@@ -183,9 +183,9 @@ func TestFormatReportMarkdown_SkippedAfterDiffAndCollapsed(t *testing.T) {
 	for _, want := range []string{
 		"1 change(s) ready to apply",
 		"2 skipped by operator policy",
-		"## What's changing",
-		"<details>",
-		"2 section(s) skipped",
+		"<summary>What's changing</summary>",
+		"<details open>",
+		"2 section(s) disabled by operator policy",
 		"`secrets`",
 		"`pages`",
 	} {
@@ -194,18 +194,18 @@ func TestFormatReportMarkdown_SkippedAfterDiffAndCollapsed(t *testing.T) {
 		}
 	}
 
-	// Section ordering: verdict → diff → skipped(details).
+	// Section ordering: verdict -> skipped -> diff.
 	verdict := strings.Index(out, "ready to apply")
-	diffIdx := strings.Index(out, "## What's changing")
-	skipped := strings.Index(out, "2 section(s) skipped")
-	if !(verdict < diffIdx && diffIdx < skipped) {
-		t.Fatalf("expected verdict<diff<skipped, got %d<%d<%d:\n%s", verdict, diffIdx, skipped, out)
+	skipped := strings.Index(out, "2 section(s) disabled by operator policy")
+	diffIdx := strings.Index(out, "<summary>What's changing</summary>")
+	if verdict >= skipped || skipped >= diffIdx {
+		t.Fatalf("expected verdict<skipped<diff, got %d<%d<%d:\n%s", verdict, skipped, diffIdx, out)
 	}
 
-	// Skipped block must be wrapped in <details> (collapsed by default).
-	skippedBlock := out[skipped:]
-	if !strings.Contains(out[:skipped+200], "<details>") {
-		t.Errorf("skipped section must be wrapped in <details>:\n%s", skippedBlock)
+	// The block is expanded by default so the warning is readable
+	// without a click.
+	if !strings.Contains(out[:skipped], "<details open>") {
+		t.Errorf("skipped section must be wrapped in <details open>:\n%s", out)
 	}
 }
 
@@ -223,8 +223,8 @@ func TestFormatReportMarkdown_SkippedOnlyHasNoChangesVerdict(t *testing.T) {
 	for _, want := range []string{
 		"no changes",
 		"**1 skipped by operator policy**",
-		"<details>",
-		"1 section(s) skipped",
+		"<details open>",
+		"1 section(s) disabled by operator policy",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output missing %q:\n%s", want, out)

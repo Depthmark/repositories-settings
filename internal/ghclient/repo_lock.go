@@ -1,6 +1,9 @@
 package ghclient
 
-import "sync"
+import (
+	"strings"
+	"sync"
+)
 
 // RepoLock serializes per-repo work so concurrent reconciles for the same
 // (owner, repo) don't race against each other. Different repos run
@@ -16,7 +19,7 @@ func NewRepoLock() *RepoLock {
 
 // With acquires the lock for owner/repo, runs fn, releases.
 func (r *RepoLock) With(owner, name string, fn func()) {
-	key := owner + "/" + name
+	key := strings.ToLower(owner + "/" + name)
 	r.mu.Lock()
 	m, ok := r.locks[key]
 	if !ok {

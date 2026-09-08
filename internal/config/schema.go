@@ -147,8 +147,8 @@ type RulesetsConfig struct {
 // --- Branches ---
 
 type RequiredStatusChecks struct {
-	Strict   bool     `yaml:"strict" json:"strict"`
-	Contexts []string `yaml:"contexts" json:"contexts"`
+	Strict   *bool    `yaml:"strict,omitempty" json:"strict,omitempty"`
+	Contexts []string `yaml:"contexts,omitempty" json:"contexts,omitempty"`
 }
 
 type RequiredPRReviews struct {
@@ -159,22 +159,43 @@ type RequiredPRReviews struct {
 }
 
 type BranchRestrictions struct {
-	Users []string  `yaml:"users" json:"users"`
-	Teams []string  `yaml:"teams" json:"teams"`
+	Users []string  `yaml:"users,omitempty" json:"users,omitempty"`
+	Teams []string  `yaml:"teams,omitempty" json:"teams,omitempty"`
 	Apps  *[]string `yaml:"apps,omitempty" json:"apps,omitempty"`
 }
 
+// BranchProtection is the one section where configuring a branch takes
+// ownership of that branch's ENTIRE protection record.
+//
+// GitHub's PUT .../branches/{branch}/protection is a whole-object
+// replace, not a merge: the four sub-objects below must all be present
+// in the request (each accepting null to mean "off"), and the optional
+// booleans default to false when omitted. There is no way to ask the
+// endpoint to leave one setting alone. So, uniquely here, the json tags
+// deliberately drop `omitempty`: the desired document states the full
+// record, and the dry-run therefore shows exactly what the apply will
+// write. Normalize() fills the rest.
+//
+// The yaml tags keep `omitempty` — every field is still optional to
+// write; it is the wire contract, not the user contract, that demands
+// completeness.
 type BranchProtection struct {
 	Pattern                        string                `yaml:"pattern" json:"pattern"`
-	RequiredStatusChecks           *RequiredStatusChecks `yaml:"required_status_checks,omitempty" json:"required_status_checks,omitempty"`
-	EnforceAdmins                  *bool                 `yaml:"enforce_admins,omitempty" json:"enforce_admins,omitempty"`
-	RequiredPullRequestReviews     *RequiredPRReviews    `yaml:"required_pull_request_reviews,omitempty" json:"required_pull_request_reviews,omitempty"`
-	Restrictions                   *BranchRestrictions   `yaml:"restrictions,omitempty" json:"restrictions,omitempty"`
+	RequiredStatusChecks           *RequiredStatusChecks `yaml:"required_status_checks,omitempty" json:"required_status_checks"`
+	EnforceAdmins                  *bool                 `yaml:"enforce_admins,omitempty" json:"enforce_admins"`
+	RequiredPullRequestReviews     *RequiredPRReviews    `yaml:"required_pull_request_reviews,omitempty" json:"required_pull_request_reviews"`
+	Restrictions                   *BranchRestrictions   `yaml:"restrictions,omitempty" json:"restrictions"`
 	RequiredLinearHistory          *bool                 `yaml:"required_linear_history,omitempty" json:"required_linear_history,omitempty"`
 	AllowForcePushes               *bool                 `yaml:"allow_force_pushes,omitempty" json:"allow_force_pushes,omitempty"`
 	AllowDeletions                 *bool                 `yaml:"allow_deletions,omitempty" json:"allow_deletions,omitempty"`
 	RequiredConversationResolution *bool                 `yaml:"required_conversation_resolution,omitempty" json:"required_conversation_resolution,omitempty"`
-	RequiredSignatures             *bool                 `yaml:"required_signatures,omitempty" json:"required_signatures,omitempty"`
+
+	// RequiredSignatures is a separate GitHub sub-resource
+	// (.../protection/required_signatures), not a field of the
+	// protection body. It stays in the desired document so the diff
+	// reports it; the encoder strips it from the PUT and the lane
+	// applies it with its own call.
+	RequiredSignatures *bool `yaml:"required_signatures,omitempty" json:"required_signatures,omitempty"`
 }
 
 type BranchesConfig struct {
@@ -208,13 +229,19 @@ type BranchEntry struct {
 }
 
 type Environment struct {
-	Name                   string                  `yaml:"name" json:"name"`
+	Name string `yaml:"name" json:"name"`
+	//nolint:unused // Name is the resource key; Encode strips it from the body.
 	WaitTimer              *int                    `yaml:"wait_timer,omitempty" json:"wait_timer,omitempty"`
 	PreventSelfReview      *bool                   `yaml:"prevent_self_review,omitempty" json:"prevent_self_review,omitempty"`
 	Reviewers              []EnvReviewer           `yaml:"reviewers,omitempty" json:"reviewers,omitempty"`
 	DeploymentBranchPolicy *DeploymentBranchPolicy `yaml:"deployment_branch_policy,omitempty" json:"deployment_branch_policy,omitempty"`
-	Variables              []EnvVariable           `yaml:"variables,omitempty" json:"variables,omitempty"`
-	Secrets                []EnvSecretRef          `yaml:"secrets,omitempty" json:"secrets,omitempty"`
+
+	// Variables / Secrets are part of the YAML contract but are not
+	// applied yet, and they are not fields on GitHub's environment
+	// endpoint — `json:"-"` keeps them out of both the diff document
+	// and the request body. Validate reports them as unsupported.
+	Variables []EnvVariable  `yaml:"variables,omitempty" json:"-"`
+	Secrets   []EnvSecretRef `yaml:"secrets,omitempty" json:"-"`
 }
 
 type EnvironmentsConfig struct {
@@ -225,11 +252,16 @@ type EnvironmentsConfig struct {
 
 type Webhook struct {
 	URL         string   `yaml:"url" json:"url"`
-	ContentType string   `yaml:"content_type,omitempty" json:"content_type,omitempty"`
-	SecretRef   string   `yaml:"secret_ref,omitempty" json:"secret_ref,omitempty"`
-	InsecureSSL bool     `yaml:"insecure_ssl,omitempty" json:"insecure_ssl,omitempty"`
-	Active      bool     `yaml:"active" json:"active"`
-	Events      []string `yaml:"events" json:"events"`
+	ContentType *string  `yaml:"content_type,omitempty" json:"content_type,omitempty"`
+	InsecureSSL *bool    `yaml:"insecure_ssl,omitempty" json:"insecure_ssl,omitempty"`
+	Active      *bool    `yaml:"active,omitempty" json:"active,omitempty"`
+	Events      []string `yaml:"events,omitempty" json:"events,omitempty"`
+
+	// SecretRef names a webhook secret held outside this repo. It is
+	// part of the user-facing YAML contract but is NOT a GitHub wire
+	// field and must never reach the diff document, hence `json:"-"`.
+	// Not applied yet — Validate reports it as unsupported.
+	SecretRef string `yaml:"secret_ref,omitempty" json:"-"`
 }
 
 type WebhooksConfig struct {
@@ -241,7 +273,7 @@ type WebhooksConfig struct {
 type Autolink struct {
 	KeyPrefix      string `yaml:"key_prefix" json:"key_prefix"`
 	URLTemplate    string `yaml:"url_template" json:"url_template"`
-	IsAlphanumeric bool   `yaml:"is_alphanumeric,omitempty" json:"is_alphanumeric,omitempty"`
+	IsAlphanumeric *bool  `yaml:"is_alphanumeric,omitempty" json:"is_alphanumeric,omitempty"`
 }
 
 type AutolinksConfig struct {
@@ -305,9 +337,13 @@ type VariablesConfig struct {
 
 type DeployKey struct {
 	Title    string `yaml:"title" json:"title"`
-	KeyRef   string `yaml:"key_ref,omitempty" json:"key_ref,omitempty"`
-	Key      string `yaml:"key,omitempty" json:"key,omitempty"`
-	ReadOnly bool   `yaml:"read_only" json:"read_only"`
+	ReadOnly *bool  `yaml:"read_only,omitempty" json:"read_only,omitempty"`
+
+	// Key / KeyRef carry the material itself. They are user-facing
+	// YAML only: the public key is never diffed (GitHub never returns
+	// it) and must not land in the diff document.
+	KeyRef string `yaml:"key_ref,omitempty" json:"-"`
+	Key    string `yaml:"key,omitempty" json:"-"`
 }
 
 type DeployKeysConfig struct {
@@ -338,3 +374,11 @@ type CollaboratorsConfig struct {
 type FileVersion struct {
 	Version int `yaml:"_version" json:"_version"`
 }
+
+// Ptr returns a pointer to v. Optional scalars in this schema are
+// pointers so that "the operator did not mention this field" stays
+// distinguishable from "the operator set it to the zero value" — see
+// the package doc. Ptr is the ergonomic way to build a literal:
+//
+//	Webhook{URL: u, Active: config.Ptr(false)}
+func Ptr[T any](v T) *T { return &v }

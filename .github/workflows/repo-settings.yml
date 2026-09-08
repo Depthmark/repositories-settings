@@ -14,20 +14,31 @@
 #       paths: ['.github/settings/**']
 #   permissions:
 #     contents: read
-#     checks: write
-#     id-token: write
 #     pull-requests: write    # for the dry-run sticky comment
+#     id-token: write         # see "Authentication" below
 #   jobs:
 #     settings:
-#       uses: Depthmark/repositories-settings/.github/workflows/repo-settings.yml@main
+#       uses: Depthmark/repositories-settings/.github/workflows/repo-settings.yml@<verified-full-commit-sha>
 #       with:
-#         auth-method: sts              # or "github-app"
-#         # STS options (if auth-method: sts)
-#         sts-url: https://github-sts.example.com
-#         sts-app: depthmark-release-bot
-#         sts-identity: repo-settings
-#       secrets:
-#         api-secret: ${{ secrets.REPO_SETTINGS_API_SECRET }}
+#         auth-mode: oidc
+#
+# Authentication
+# --------------
+# auth-mode: oidc (recommended) authenticates with the short-lived token
+# GitHub mints for this workflow. The token names this repository, and
+# the service will only reconcile the repository its caller proves it
+# runs in — so a leaked token cannot reconfigure anything else, and there
+# is no shared secret to distribute or rotate.
+#
+# auth-mode: token sends a static secret that every repository shares.
+# It is not repository-scoped: whoever holds it can reconcile any
+# repository the App is installed in. Use it only for a trusted operator
+# workflow when OIDC is unavailable.
+#
+# `id-token: write` must be granted by the caller in either mode, because
+# a reusable workflow can only narrow the permissions it is given. The
+# permission alone grants no repository access — it only allows
+# requesting an identity token — and it is unused in token mode.
 
 name: repo-settings
 
@@ -39,29 +50,26 @@ on:
         required: false
         type: string
         default: "https://repo-settings.internal"
-      auth-method:
-        description: "Authentication method: 'sts' or 'github-app'"
+      auth-mode:
+        description: |
+          How to authenticate to the service: "oidc" (this workflow's
+          GitHub identity token, repository-scoped) or "token" (the
+          shared api-token secret, not repository-scoped).
         required: false
         type: string
-        default: "sts"
-      sts-url:
-        description: "STS service URL (required if auth-method is sts)"
-        required: false
-        type: string
-        default: ""
-      sts-app:
-        description: "STS app name (required if auth-method is sts)"
-        required: false
-        type: string
-        default: ""
-      sts-identity:
-        description: "STS identity (required if auth-method is sts)"
+        default: "oidc"
+      oidc-audience:
+        description: |
+          Audience to request for the identity token. Must equal the
+          service's OIDC_AUDIENCE. Ignored when auth-mode is "token".
         required: false
         type: string
         default: "repo-settings"
     secrets:
-      api-secret:
-        description: "Shared API secret (required if auth-method is github-app, or as fallback)"
+      api-token:
+        description: |
+          Static token matching the repo-settings service API_TOKEN.
+          Required when auth-mode is "token"; unused otherwise.
         required: false
 
 permissions: {}
@@ -69,12 +77,18 @@ permissions: {}
 jobs:
   settings:
     name: repo-settings
+    # Fork contributions are checked by the App webhook. A feature-branch
+    # push must never reach a mutation-capable service request.
+    if: >-
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'push' && github.event.deleted == false &&
+       github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
     runs-on: ubuntu-slim
     permissions:
-      contents: read
-      checks: write
-      id-token: write       # Required for STS OIDC token
-      pull-requests: write  # Required for the dry-run sticky PR comment
+      contents: read        # Read .github/settings/*.yml for schema validation
+      pull-requests: write  # Post and update the dry-run sticky PR comment
+      id-token: write       # Mint this workflow's identity token (auth-mode: oidc)
     steps:
       # --- Pre-flight: validate YAML schemas ---
       - name: Checkout
@@ -131,21 +145,57 @@ jobs:
           VALID=$(jq -r '.valid // false' <<< "$RESPONSE")
           if [ "$VALID" != "true" ]; then
             echo "::error::Schema validation failed — check the summary for details"
-            jq -r '.files[] | select(.valid == false) | "  \(.file): \(.errors | join("; "))"' <<< "$RESPONSE" 2>/dev/null
+            jq -r '.files[] | select(.valid == false) | "  \(.file): \(.issues | join("; "))"' <<< "$RESPONSE" 2>/dev/null
             exit 1
           fi
           echo "All settings files are valid"
 
-      # --- Auth: STS ---
-      - name: Get STS token
-        if: inputs.auth-method == 'sts'
-        id: sts
-        uses: Depthmark/github-sts-action@6068d40ef75361b70501900e3345e0c65cbd5c44 # main
-        with:
-          sts-url: ${{ inputs.sts-url }}
-          scope: ${{ github.repository }}
-          identity: ${{ inputs.sts-identity }}
-          app: ${{ inputs.sts-app }}
+      # --- Resolve the API credential ---
+      # Both modes end at the same place: REPO_SETTINGS_BEARER in the
+      # job environment, masked, so every later step sends one header
+      # and neither knows which mode produced it.
+      - name: Resolve service credential
+        env:
+          AUTH_MODE: ${{ inputs.auth-mode }}
+          OIDC_AUDIENCE: ${{ inputs.oidc-audience }}
+          API_TOKEN: ${{ secrets.api-token }}  # zizmor: ignore[secrets-outside-env]
+        run: |
+          set -euo pipefail
+
+          if [ "$AUTH_MODE" = "oidc" ]; then
+            if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+              echo "::error::auth-mode is oidc but no identity token is available."
+              echo "::error::Grant 'id-token: write' in the calling workflow's permissions."
+              exit 1
+            fi
+            # The request token authenticates this job to the Actions
+            # identity endpoint; it is not the credential we send on.
+            BEARER=$(curl -sS --fail-with-body --get \
+              -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              --data-urlencode "audience=${OIDC_AUDIENCE}" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}" \
+              | jq -r '.value')
+            if [ -z "$BEARER" ] || [ "$BEARER" = "null" ]; then
+              echo "::error::the Actions identity endpoint returned no token"
+              exit 1
+            fi
+            echo "Authenticating with this workflow's GitHub identity (audience: ${OIDC_AUDIENCE})"
+          elif [ "$AUTH_MODE" = "token" ]; then
+            if [ -z "${API_TOKEN:-}" ]; then
+              echo "::error::auth-mode is token but the api-token secret is empty."
+              echo "::error::Pass secrets.api-token, or switch to auth-mode: oidc."
+              exit 1
+            fi
+            BEARER="$API_TOKEN"
+            echo "Authenticating with the shared static token (not repository-scoped)"
+          else
+            echo "::error::auth-mode must be oidc or token"
+            exit 1
+          fi
+
+          # Mask before the value can reach any later log line.
+          echo "::add-mask::${BEARER}"
+          echo "REPO_SETTINGS_BEARER=${BEARER}" >> "$GITHUB_ENV"
 
       # --- PR Check ---
       - name: PR Check (dry-run)
@@ -153,25 +203,16 @@ jobs:
         if: github.event_name == 'pull_request'
         env:
           API_URL: ${{ inputs.api-url }}
-          AUTH_METHOD: ${{ inputs.auth-method }}
-          STS_TOKEN: ${{ steps.sts.outputs.token }}
-          API_SECRET: ${{ secrets.api-secret }}  # zizmor: ignore[secrets-outside-env]
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO_OWNER: ${{ github.repository_owner }}
           REPO_NAME: ${{ github.event.repository.name }}
         run: |
           # Build curl args as an array so word-splitting / quoting are clean.
-          HEADERS=( -H "Content-Type: application/json" )
-
-          if [ "$AUTH_METHOD" = "sts" ]; then
-            HEADERS+=( -H "Authorization: Bearer ${STS_TOKEN}" )
-          elif [ "$AUTH_METHOD" = "github-app" ]; then
-            HEADERS+=( -H "X-Auth-Method: github-app" )
-            if [ -n "$API_SECRET" ]; then
-              HEADERS+=( -H "Authorization: Bearer ${API_SECRET}" )
-            fi
-          fi
+          HEADERS=(
+            -H "Content-Type: application/json"
+            -H "Authorization: Bearer ${REPO_SETTINGS_BEARER}"
+          )
 
           BODY=$(jq -n \
             --arg owner "$REPO_OWNER" \
@@ -289,44 +330,44 @@ jobs:
           # Pass commits via env, never inline `${{ ... }}` into shell.
           COMMITS_JSON: ${{ toJSON(github.event.commits) }}
         run: |
-          CHANGED=$(jq -r '.[].added + .[].modified + .[].removed | .[]' \
-            <<< "$COMMITS_JSON" 2>/dev/null \
-            | grep '^\.github/settings/' \
-            | sort -u \
-            | jq -R -s -c 'split("\n") | map(select(. != ""))')
+          # Actions push payloads can omit per-commit file lists. In that
+          # case reconcile all settings rather than silently filtering
+          # every resource out. An explicit empty list still means no
+          # settings changed when all commit file lists were supplied.
+          CHANGED=$(jq -c '
+            if type != "array" or length == 0 then null
+            elif all(.[]; has("added") and has("modified") and has("removed")) then
+              [.[] | (.added + .modified + .removed)[]
+               | select(startswith(".github/settings/"))] | unique
+            else null end
+          ' <<< "$COMMITS_JSON")
           echo "files=${CHANGED}" >> "$GITHUB_OUTPUT"
           echo "Changed settings files: ${CHANGED}"
 
       # --- Apply on merge ---
       - name: Apply settings
-        if: github.event_name == 'push'
+        if: >-
+          github.event_name == 'push' && github.event.deleted == false &&
+          github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         env:
           API_URL: ${{ inputs.api-url }}
-          AUTH_METHOD: ${{ inputs.auth-method }}
-          STS_TOKEN: ${{ steps.sts.outputs.token }}
-          API_SECRET: ${{ secrets.api-secret }}  # zizmor: ignore[secrets-outside-env]
           REPO_OWNER: ${{ github.repository_owner }}
           REPO_NAME: ${{ github.event.repository.name }}
           CHANGED_FILES: ${{ steps.changed.outputs.files }}
         run: |
-          HEADERS=( -H "Content-Type: application/json" )
-
-          if [ "$AUTH_METHOD" = "sts" ]; then
-            HEADERS+=( -H "Authorization: Bearer ${STS_TOKEN}" )
-          elif [ "$AUTH_METHOD" = "github-app" ]; then
-            HEADERS+=( -H "X-Auth-Method: github-app" )
-            if [ -n "$API_SECRET" ]; then
-              HEADERS+=( -H "Authorization: Bearer ${API_SECRET}" )
-            fi
-          fi
+          HEADERS=(
+            -H "Content-Type: application/json"
+            -H "Authorization: Bearer ${REPO_SETTINGS_BEARER}"
+          )
 
           set -euo pipefail
 
           BODY=$(jq -n \
             --arg owner "$REPO_OWNER" \
             --arg repo "$REPO_NAME" \
-            --argjson changed_files "${CHANGED_FILES:-[]}" \
-            '{owner: $owner, repo: $repo, changed_files: $changed_files}')
+            --argjson changed_files "${CHANGED_FILES:-null}" \
+            '{owner: $owner, repo: $repo} +
+             if $changed_files == null then {} else {changed_files: $changed_files} end')
 
           # -s + -o + -w lets us see the body even on non-2xx, instead
           # of having `-f` swallow everything with exit code 22. We need
@@ -336,11 +377,30 @@ jobs:
             "${HEADERS[@]}" \
             -d "$BODY")
 
+          # The server renders the canonical summary (verdict line,
+          # error table with resource/action/reason, per-action tables)
+          # via reconciler.FormatReportMarkdown — same formatter the
+          # dry-run sticky comment uses. Write that to the step summary
+          # verbatim so a reviewer scrolling the run sees clear failure
+          # reasons, then keep the raw JSON in a collapsed block for
+          # debugging.
+          SUMMARY=$(jq -r '.summary // ""' /tmp/reconcile.json)
           {
-            echo "## repo-settings applied (HTTP ${HTTP_CODE})"
+            if [ -n "$SUMMARY" ]; then
+              printf '%s\n' "$SUMMARY"
+            else
+              echo "## repo-settings applied (HTTP ${HTTP_CODE})"
+              echo "_/api/reconcile did not return a rendered summary._"
+            fi
+            echo
+            echo "<details>"
+            echo "<summary>Raw /api/reconcile response (HTTP ${HTTP_CODE})</summary>"
+            echo
             echo '```json'
-            jq . /tmp/reconcile.json 2>/dev/null || cat /tmp/reconcile.json
+            jq 'del(.summary)' /tmp/reconcile.json 2>/dev/null || cat /tmp/reconcile.json
             echo '```'
+            echo
+            echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then

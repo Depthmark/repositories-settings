@@ -36,16 +36,36 @@ func namedListRun(
 	if len(actionable) == 0 {
 		return diffs, nil, nil
 	}
-	results, _ := conc.Map(ctx, actionable, conc.DefaultApplierConcurrency, func(ctx context.Context, d diff.Diff) (Result, error) {
+	results, errs := conc.Map(ctx, actionable, conc.DefaultApplierConcurrency, func(ctx context.Context, d diff.Diff) (Result, error) {
 		act, err := mutate(ctx, d)
 		if err != nil {
+			// A Pending action pairs with an explanation rather than a
+			// failure: the lane is telling us why there was nothing to
+			// send, not that a request went wrong.
+			if act == Pending {
+				return pending(d.Resource, err.Error()), nil
+			}
 			if act == "" {
 				act = actionFromDiff(d.Action)
 			}
 			return failure(d.Resource, act, err, 1), nil
 		}
+		if act == Pending {
+			return pending(d.Resource, ""), nil
+		}
 		return success(d.Resource, act, 1), nil
 	})
+	// conc.Map fills a slot with (zero Result, err) for any item it never
+	// ran — a cancelled context skips queued work. Left alone those slots
+	// report an unnamed resource that neither succeeded nor failed, so the
+	// report loses the mutations that were dropped. Name them explicitly.
+	for i, err := range errs {
+		if err == nil {
+			continue
+		}
+		d := actionable[i]
+		results[i] = failure(d.Resource, actionFromDiff(d.Action), err, 0)
+	}
 	return diffs, results, nil
 }
 

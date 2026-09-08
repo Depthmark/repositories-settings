@@ -3,10 +3,12 @@ package applier
 import (
 	"context"
 	"fmt"
-	"net/http"
+
+	"github.com/google/go-github/v76/github"
 
 	"github.com/Depthmark/repositories-settings/internal/config"
 	"github.com/Depthmark/repositories-settings/internal/diff"
+	"github.com/Depthmark/repositories-settings/internal/ghapi"
 	"github.com/Depthmark/repositories-settings/internal/ghclient"
 )
 
@@ -21,22 +23,18 @@ func NewSecretsLane(cfg *config.SecretsConfig) Lane {
 		Resource: "secrets",
 		Run: func(ctx context.Context, cl *ghclient.Client, repo config.Repo, dryRun bool) ([]diff.Diff, []Result, error) {
 			fetch := func(ctx context.Context) ([]map[string]any, error) {
-				type liveSecrets struct {
-					Secrets []struct {
-						Name string `json:"name"`
-					} `json:"secrets"`
-				}
-				var ls liveSecrets
-				_, err := cl.DoREST(ctx, ghclient.PriorityCronReconcile, repo.Owner, http.MethodGet,
-					fmt.Sprintf("/repos/%s/%s/actions/secrets?per_page=100", repo.Owner, repo.Name), nil, &ls)
+				secrets, err := listAll(ctx, cl, repo, ghapi.RouteSecrets,
+					func(ctx context.Context, opts *github.ListOptions) ([]*github.Secret, *github.Response, error) {
+						page, resp, err := cl.GH().Actions.ListRepoSecrets(ctx, repo.Owner, repo.Name, opts)
+						if err != nil {
+							return nil, resp, err
+						}
+						return page.Secrets, resp, nil
+					})
 				if err != nil {
 					return nil, err
 				}
-				out := make([]map[string]any, 0, len(ls.Secrets))
-				for _, s := range ls.Secrets {
-					out = append(out, map[string]any{"name": s.Name})
-				}
-				return out, nil
+				return mapAll(secrets, ghapi.DecodeSecret), nil
 			}
 			desired, err := diff.ToMaps(cfg.RepositorySecrets)
 			if err != nil {
@@ -49,11 +47,15 @@ func NewSecretsLane(cfg *config.SecretsConfig) Lane {
 				}
 				switch d.Action {
 				case diff.Create:
-					// Cannot create without a value. Record as skipped.
-					return Skipped, fmt.Errorf("secret %q referenced in config but value not provided", name)
+					// A declared secret with no value in GitHub yet is
+					// the normal steady state, not a failure: the value
+					// comes from a separate store, and this service only
+					// manages the name. Reporting it as an error made
+					// every PR check on such a repo go red forever.
+					return Pending, fmt.Errorf("secret %q is declared here but its value has not been uploaded to GitHub — set it in the repository's Actions secrets, or remove it from secrets.yml", name)
 				case diff.Delete:
-					_, err := cl.DoREST(ctx, ghclient.PriorityMergeApply, repo.Owner, http.MethodDelete,
-						fmt.Sprintf("/repos/%s/%s/actions/secrets/%s", repo.Owner, repo.Name, name), nil, nil)
+					_, err := cl.GH().Actions.DeleteRepoSecret(
+						writeCtx(ctx, repo, ghapi.RouteSecretsName), repo.Owner, repo.Name, name)
 					return Deleted, err
 				}
 				return Skipped, nil
@@ -71,23 +73,18 @@ func NewVariablesLane(cfg *config.VariablesConfig) Lane {
 		Resource: "variables",
 		Run: func(ctx context.Context, cl *ghclient.Client, repo config.Repo, dryRun bool) ([]diff.Diff, []Result, error) {
 			fetch := func(ctx context.Context) ([]map[string]any, error) {
-				type liveVars struct {
-					Variables []struct {
-						Name  string `json:"name"`
-						Value string `json:"value"`
-					} `json:"variables"`
-				}
-				var lv liveVars
-				_, err := cl.DoREST(ctx, ghclient.PriorityCronReconcile, repo.Owner, http.MethodGet,
-					fmt.Sprintf("/repos/%s/%s/actions/variables?per_page=100", repo.Owner, repo.Name), nil, &lv)
+				vars, err := listAll(ctx, cl, repo, ghapi.RouteVariables,
+					func(ctx context.Context, opts *github.ListOptions) ([]*github.ActionsVariable, *github.Response, error) {
+						page, resp, err := cl.GH().Actions.ListRepoVariables(ctx, repo.Owner, repo.Name, opts)
+						if err != nil {
+							return nil, resp, err
+						}
+						return page.Variables, resp, nil
+					})
 				if err != nil {
 					return nil, err
 				}
-				out := make([]map[string]any, 0, len(lv.Variables))
-				for _, v := range lv.Variables {
-					out = append(out, map[string]any{"name": v.Name, "value": v.Value})
-				}
-				return out, nil
+				return mapAll(vars, ghapi.DecodeVariable), nil
 			}
 			desired, err := diff.ToMaps(cfg.Variables)
 			if err != nil {
@@ -98,20 +95,19 @@ func NewVariablesLane(cfg *config.VariablesConfig) Lane {
 				if name == "" {
 					name = stringField(d.Current, "name")
 				}
+				v := &github.ActionsVariable{Name: name, Value: stringField(d.Desired, "value")}
 				switch d.Action {
 				case diff.Create:
-					_, err := cl.DoREST(ctx, ghclient.PriorityMergeApply, repo.Owner, http.MethodPost,
-						fmt.Sprintf("/repos/%s/%s/actions/variables", repo.Owner, repo.Name),
-						map[string]any{"name": name, "value": stringField(d.Desired, "value")}, nil)
+					_, err := cl.GH().Actions.CreateRepoVariable(
+						writeCtx(ctx, repo, ghapi.RouteVariables), repo.Owner, repo.Name, v)
 					return Created, err
 				case diff.Update:
-					_, err := cl.DoREST(ctx, ghclient.PriorityMergeApply, repo.Owner, http.MethodPatch,
-						fmt.Sprintf("/repos/%s/%s/actions/variables/%s", repo.Owner, repo.Name, name),
-						map[string]any{"name": name, "value": stringField(d.Desired, "value")}, nil)
+					_, err := cl.GH().Actions.UpdateRepoVariable(
+						writeCtx(ctx, repo, ghapi.RouteVariablesName), repo.Owner, repo.Name, v)
 					return Updated, err
 				case diff.Delete:
-					_, err := cl.DoREST(ctx, ghclient.PriorityMergeApply, repo.Owner, http.MethodDelete,
-						fmt.Sprintf("/repos/%s/%s/actions/variables/%s", repo.Owner, repo.Name, name), nil, nil)
+					_, err := cl.GH().Actions.DeleteRepoVariable(
+						writeCtx(ctx, repo, ghapi.RouteVariablesName), repo.Owner, repo.Name, name)
 					return Deleted, err
 				}
 				return Skipped, nil
@@ -130,67 +126,59 @@ func NewDeployKeysLane(cfg *config.DeployKeysConfig) Lane {
 		Resource: "deploy_keys",
 		Run: func(ctx context.Context, cl *ghclient.Client, repo config.Repo, dryRun bool) ([]diff.Diff, []Result, error) {
 			fetch := func(ctx context.Context) ([]map[string]any, error) {
-				type liveKey struct {
-					ID       int    `json:"id"`
-					Title    string `json:"title"`
-					Key      string `json:"key"`
-					ReadOnly bool   `json:"read_only"`
-				}
-				keys, err := ghclient.Paginate[liveKey](ctx, cl, ghclient.PriorityCronReconcile, repo.Owner,
-					fmt.Sprintf("/repos/%s/%s/keys", repo.Owner, repo.Name))
+				keys, err := listAll(ctx, cl, repo, ghapi.RouteKeys,
+					func(ctx context.Context, opts *github.ListOptions) ([]*github.Key, *github.Response, error) {
+						return cl.GH().Repositories.ListKeys(ctx, repo.Owner, repo.Name, opts)
+					})
 				if err != nil {
 					return nil, err
 				}
-				out := make([]map[string]any, 0, len(keys))
-				for _, k := range keys {
-					out = append(out, map[string]any{
-						"_id":       k.ID,
-						"title":     k.Title,
-						"read_only": k.ReadOnly,
-					})
-				}
-				return out, nil
+				return mapAll(keys, ghapi.DecodeKey), nil
 			}
-			// Strip key field from desired since we don't compare it.
-			items := make([]map[string]any, 0, len(cfg.DeployKeys))
+			// The key material never reaches the diff document: GitHub
+			// does not return it, so it could never compare equal. It
+			// is looked up by title at mutate time instead.
+			items, err := diff.ToMaps(cfg.DeployKeys)
+			if err != nil {
+				return nil, nil, err
+			}
+			material := make(map[string]config.DeployKey, len(cfg.DeployKeys))
 			for _, k := range cfg.DeployKeys {
-				items = append(items, map[string]any{
-					"title":     k.Title,
-					"read_only": k.ReadOnly,
-					"_key":      k.Key, // private; not diffed
-				})
+				material[k.Title] = k
 			}
 			mutate := func(ctx context.Context, d diff.Diff) (Action, error) {
 				title := stringField(d.Desired, "title")
 				if title == "" {
 					title = stringField(d.Current, "title")
 				}
+				remove := func(id int64) error {
+					_, err := cl.GH().Repositories.DeleteKey(
+						writeCtx(ctx, repo, ghapi.RouteKeysID), repo.Owner, repo.Name, id)
+					return err
+				}
 				switch d.Action {
 				case diff.Create, diff.Update:
-					body := map[string]any{
-						"title":     title,
-						"key":       d.Desired.(map[string]any)["_key"],
-						"read_only": d.Desired.(map[string]any)["read_only"],
+					k := material[title]
+					if k.Key == "" {
+						// Same shape as an unprovisioned secret: the
+						// config names a key whose material lives
+						// elsewhere. Nothing to do, and not an error.
+						return Pending, fmt.Errorf("deploy key %q has no `key` value in deploy-keys.yml, so there is nothing to upload", title)
 					}
+					// GitHub has no PATCH for deploy keys.
 					if d.Action == diff.Update {
-						// Delete then create.
-						id := intField(d.Current, "_id")
-						if _, err := cl.DoREST(ctx, ghclient.PriorityMergeApply, repo.Owner, http.MethodDelete,
-							fmt.Sprintf("/repos/%s/%s/keys/%d", repo.Owner, repo.Name, int(id)), nil, nil); err != nil {
+						if err := remove(int64(intField(d.Current, "_id"))); err != nil {
 							return Updated, err
 						}
 					}
-					_, err := cl.DoREST(ctx, ghclient.PriorityMergeApply, repo.Owner, http.MethodPost,
-						fmt.Sprintf("/repos/%s/%s/keys", repo.Owner, repo.Name), body, nil)
+					_, _, err := cl.GH().Repositories.CreateKey(
+						writeCtx(ctx, repo, ghapi.RouteKeys), repo.Owner, repo.Name, ghapi.EncodeKey(k))
 					if d.Action == diff.Create {
 						return Created, err
 					}
 					return Updated, err
 				case diff.Delete:
-					id := intField(d.Current, "_id")
-					_, err := cl.DoREST(ctx, ghclient.PriorityMergeApply, repo.Owner, http.MethodDelete,
-						fmt.Sprintf("/repos/%s/%s/keys/%d", repo.Owner, repo.Name, int(id)), nil, nil)
-					return Deleted, err
+					return Deleted, remove(int64(intField(d.Current, "_id")))
 				}
 				return Skipped, nil
 			}

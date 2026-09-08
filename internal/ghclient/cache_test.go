@@ -38,25 +38,61 @@ func TestETagCache_SetUpdatesInPlace(t *testing.T) {
 	}
 }
 
-// InvalidatePrefix wipes every key sharing the prefix and leaves the
-// rest intact.
-func TestETagCache_InvalidatePrefix(t *testing.T) {
-	c := newETagCache(0) // default cap
-	c.Set("/repos/x/y", etagEntry{etag: `"a"`, body: []byte("repo")})
-	c.Set("/repos/x/y/topics", etagEntry{etag: `"b"`, body: []byte("topics")})
-	c.Set("/repos/other/z", etagEntry{etag: `"c"`, body: []byte("z")})
+// InvalidatePath drops the write target, everything beneath it, and the
+// collection a written item belongs to — and nothing else. Entries are
+// stored the way the transport stores them: keyed by absolute URL, with
+// the request path carried on the entry.
+func TestETagCache_InvalidatePath(t *testing.T) {
+	const host = "https://api.github.com"
+	set := func(c *etagCache, path string) {
+		c.Set(host+path, etagEntry{etag: `"v"`, body: []byte("b"), path: path})
+	}
+	seed := func() *etagCache {
+		c := newETagCache(0) // default cap
+		set(c, "/repos/x/y")
+		set(c, "/repos/x/y/topics")
+		set(c, "/repos/x/y/rulesets")
+		set(c, "/repos/x/yz")
+		set(c, "/repos/other/z")
+		return c
+	}
 
-	c.InvalidatePrefix("/repos/x/y")
+	t.Run("write above the read", func(t *testing.T) {
+		c := seed()
+		c.InvalidatePath("/repos/x/y")
+		for _, gone := range []string{"/repos/x/y", "/repos/x/y/topics", "/repos/x/y/rulesets"} {
+			if _, ok := c.Get(host + gone); ok {
+				t.Errorf("%s should be invalidated", gone)
+			}
+		}
+		for _, kept := range []string{"/repos/x/yz", "/repos/other/z"} {
+			if _, ok := c.Get(host + kept); !ok {
+				t.Errorf("%s must survive: it is not a path ancestor or descendant", kept)
+			}
+		}
+	})
 
-	if _, ok := c.Get("/repos/x/y"); ok {
-		t.Fatal("/repos/x/y should be invalidated")
-	}
-	if _, ok := c.Get("/repos/x/y/topics"); ok {
-		t.Fatal("/repos/x/y/topics should be invalidated (prefix match)")
-	}
-	if _, ok := c.Get("/repos/other/z"); !ok {
-		t.Fatal("/repos/other/z must survive")
-	}
+	t.Run("write below the read", func(t *testing.T) {
+		c := seed()
+		// Creating one ruleset changes what the collection returns.
+		c.InvalidatePath("/repos/x/y/rulesets/7")
+		if _, ok := c.Get(host + "/repos/x/y/rulesets"); ok {
+			t.Error("the collection read must be invalidated by an item write")
+		}
+		if _, ok := c.Get(host + "/repos/x/y/topics"); !ok {
+			t.Error("a sibling collection is unaffected by a ruleset write")
+		}
+	})
+
+	t.Run("query strings share a path", func(t *testing.T) {
+		c := newETagCache(0)
+		c.Set(host+"/repos/x/y/rulesets?page=2",
+			etagEntry{etag: `"v"`, body: []byte("b"), path: "/repos/x/y/rulesets"})
+		c.InvalidatePath("/repos/x/y/rulesets")
+		if _, ok := c.Get(host + "/repos/x/y/rulesets?page=2"); ok {
+			t.Error("a paginated read of the same path must be invalidated")
+		}
+	})
 }
 
 // Default capacity: passing 0 falls back to 10 000 and the cache

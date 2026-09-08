@@ -1,14 +1,16 @@
-// Package reconciler is the per-repo orchestrator. Mirrors
-// src/github/reconciler.ts: Phase A repo+topics first (it gates
-// archival/visibility downstream), then 13 resource lanes fan out in
-// parallel via errgroup. Each lane's failure is captured as a synthetic
-// ApplyResult so a single broken lane doesn't abort the reconcile.
+// Package reconciler is the per-repo orchestrator. Org policy is checked
+// first and can refuse the whole run; then Phase A applies repo+topics
+// (it gates archival and visibility downstream); then 14 resource lanes
+// fan out in parallel, joined by a sync.WaitGroup. Each lane's failure is
+// captured as a synthetic ApplyResult so a single broken lane does not
+// abort the reconcile.
 package reconciler
 
 import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,6 +23,13 @@ import (
 
 // Report is the per-reconcile outcome returned to callers
 // (HTTP /api/reconcile, cron worker reports).
+//
+// Summary is the FormatReportMarkdown rendering — verdict line, error
+// table, per-action tables. It is populated on the apply path so callers
+// (notably the GitHub Actions workflow) can write it straight into a
+// step summary without re-implementing the formatter. /api/check returns
+// the same string at the response top-level for backwards compatibility,
+// so it is left empty there to avoid duplication.
 type Report struct {
 	Repo      config.Repo      `json:"repo"`
 	Timestamp time.Time        `json:"timestamp"`
@@ -29,6 +38,15 @@ type Report struct {
 	Applied   []applier.Result `json:"applied"`
 	DryRun    bool             `json:"dry_run"`
 	Duration  time.Duration    `json:"duration"`
+	Summary   string           `json:"summary,omitempty"`
+
+	// Violations is every org policy breach found in the desired state,
+	// warnings included. It is populated on dry runs too, so a PR check
+	// shows the contributor what an apply would refuse.
+	Violations []config.PolicyViolation `json:"violations,omitempty"`
+	// Blocked is true when org policy refused the run. No lane ran and
+	// nothing was written; Violations says why.
+	Blocked bool `json:"blocked,omitempty"`
 }
 
 // Prefetched is optional repo state populated by the cron worker via
@@ -63,7 +81,28 @@ func (r *Reconciler) Reconcile(
 	ctx context.Context,
 	cl *ghclient.Client,
 	repo config.Repo,
-	settings *config.Settings,
+	res *config.Resolution,
+	trigger config.Trigger,
+	dryRun bool,
+	prefetched *Prefetched,
+) (*Report, error) {
+	var (
+		rep *Report
+		err error
+	)
+	cl.RepoLock().With(repo.Owner, repo.Name, func() {
+		rep, err = r.reconcile(ctx, cl, repo, res, trigger, dryRun, prefetched)
+	})
+	return rep, err
+}
+
+// reconcile contains the phased operation while Reconcile owns the
+// per-repository serialization boundary shared by every trigger.
+func (r *Reconciler) reconcile(
+	ctx context.Context,
+	cl *ghclient.Client,
+	repo config.Repo,
+	res *config.Resolution,
 	trigger config.Trigger,
 	dryRun bool,
 	prefetched *Prefetched,
@@ -78,8 +117,33 @@ func (r *Reconciler) Reconcile(
 	}
 	log.Info("reconcile start", "dry_run", dryRun)
 
-	if settings == nil {
-		settings = &config.Settings{}
+	settings := res.Desired()
+
+	// Org policy is checked before anything is read or written. A
+	// repository that is trying to unlock a field the org locked, or to
+	// grant itself a permission above the org ceiling, must not get a
+	// partial apply of the parts that happened to be legal.
+	if res != nil {
+		rep.Violations = res.Violations
+	}
+	for _, v := range rep.Violations {
+		metrics.PolicyViolationsTotal.WithLabelValues(string(v.Severity), violationGroup(v.Field)).Inc()
+	}
+	if blocking := res.Blocking(); len(blocking) > 0 {
+		rep.Blocked = true
+		rep.Duration = time.Since(start)
+		for _, v := range blocking {
+			rep.Applied = append(rep.Applied, applier.Result{
+				Resource: v.Field,
+				Action:   applier.Skipped,
+				Success:  false,
+				Error:    v.Message + " (org policy: " + v.OrgPolicy + ")",
+			})
+		}
+		metrics.ReconcileTotal.WithLabelValues(string(trigger), "policy_blocked").Inc()
+		metrics.ReconcileDuration.WithLabelValues(string(trigger)).Observe(rep.Duration.Seconds())
+		log.Warn("reconcile refused by org policy", "violations", len(blocking))
+		return rep, nil
 	}
 
 	// Phase A: repo + topics (sequential — gates archival / visibility).
@@ -189,6 +253,17 @@ func (r *Reconciler) Reconcile(
 		"status", status,
 	)
 	return rep, nil
+}
+
+// violationGroup bounds the metric label to the resource group. A
+// violation's Field can carry a team slug or a ruleset name, which is
+// user-supplied and unbounded; using it raw would let one repository's
+// configuration blow up the metric's cardinality.
+func violationGroup(field string) string {
+	if i := strings.IndexByte(field, '.'); i >= 0 {
+		return field[:i]
+	}
+	return field
 }
 
 // runLane is the per-lane body, with panic recovery so a buggy lane

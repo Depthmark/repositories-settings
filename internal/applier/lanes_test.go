@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -71,10 +73,45 @@ func (rec *recorder) count(method, path string) int {
 // applier tests (App auth disabled — tests pass plain owner strings).
 func newTestClient(srv *httptest.Server) (*ghclient.Client, *ghclient.RateLimiter) {
 	rl := ghclient.NewRateLimiter(logger.Discard(), ghclient.Options{Concurrency: 5})
+	httpc := srv.Client()
+	httpc.Transport = &routeAssertingTransport{next: httpc.Transport}
 	cl := ghclient.New(ghclient.Config{
-		APIURL: srv.URL, Limiter: rl, HTTPClient: srv.Client(), Logger: logger.Discard(),
+		APIURL: srv.URL, Limiter: rl, HTTPClient: httpc, Logger: logger.Discard(),
 	})
 	return cl, rl
+}
+
+// routeAssertingTransport checks that the route template a call site
+// declares actually describes the URL the request went to.
+//
+// Since go-github builds the URLs and the lane names the template, the
+// two can drift apart silently: nothing fails, the call is just filed
+// under the wrong metric series, and the mislabelling is only visible in
+// a dashboard nobody is looking at yet. Every lane test exercises real
+// requests through this transport, so a mismatch fails a test instead.
+type routeAssertingTransport struct {
+	next http.RoundTripper
+}
+
+func (t *routeAssertingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	route := ghclient.RouteFromContext(req.Context())
+	if route == "" || route == ghclient.RouteOther {
+		routeMismatches.Store(req.URL.Path, "no route declared")
+	} else if !routeMatchesPath(route, req.URL.Path) {
+		routeMismatches.Store(req.URL.Path, route)
+	}
+	return t.next.RoundTrip(req)
+}
+
+var routeMismatches sync.Map
+
+// routeMatchesPath turns {placeholder} into a wildcard and compares.
+func routeMatchesPath(route, path string) bool {
+	pattern := regexp.QuoteMeta(route)
+	pattern = regexp.MustCompile(`\\\{[a-z_]+\\\}`).ReplaceAllString(pattern, `[^/]+`)
+	pattern = strings.ReplaceAll(pattern, `branches/[^/]+`, `branches/.+`)
+	pattern = strings.ReplaceAll(pattern, `contents/[^/]+`, `contents/.+`)
+	return regexp.MustCompile("^" + pattern + "$").MatchString(path)
 }
 
 // firstActionable returns the first non-noop diff or fails the test.
@@ -316,8 +353,8 @@ func TestWebhooksLane_PlanAndApply(t *testing.T) {
 	defer rl.Stop()
 
 	cfg := &config.WebhooksConfig{Webhooks: []config.Webhook{
-		{URL: "https://stay.example", ContentType: "json", Active: true, Events: []string{"push"}}, // noop
-		{URL: "https://new.example", ContentType: "json", Active: true, Events: []string{"push"}},  // create
+		{URL: "https://stay.example", ContentType: config.Ptr("json"), Active: config.Ptr(true), Events: []string{"push"}}, // noop
+		{URL: "https://new.example", ContentType: config.Ptr("json"), Active: config.Ptr(true), Events: []string{"push"}},  // create
 	}}
 	_, results, err := NewWebhooksLane(cfg).Run(context.Background(), cl, config.Repo{Owner: "o", Name: "r"}, false)
 	if err != nil {
@@ -508,7 +545,7 @@ func TestSecretsLane_DeleteAndCreateBehavior(t *testing.T) {
 
 	cfg := &config.SecretsConfig{RepositorySecrets: []config.SecretRef{
 		{Name: "STAY"},   // noop
-		{Name: "NEWONE"}, // create -> failure (no value)
+		{Name: "NEWONE"}, // declared, value not yet uploaded -> pending
 	}}
 	_, results, err := NewSecretsLane(cfg).Run(context.Background(), cl, config.Repo{Owner: "o", Name: "r"}, false)
 	if err != nil {
@@ -517,18 +554,28 @@ func TestSecretsLane_DeleteAndCreateBehavior(t *testing.T) {
 	if rec.count(http.MethodDelete, "/repos/o/r/actions/secrets/GONE") != 1 {
 		t.Fatal("expected DELETE GONE")
 	}
-	// 1 success (delete) + 1 failure (create-without-value).
-	wantSuccess, wantFail := 1, 1
-	gotSuccess, gotFail := 0, 0
+	// A declared-but-not-yet-uploaded secret is the normal steady state
+	// of every repo using this feature, so it must report as pending,
+	// not as a failure that reddens the PR check on every run.
+	var deleted, pendings, failures int
 	for _, r := range results {
-		if r.Success {
-			gotSuccess++
-		} else {
-			gotFail++
+		switch {
+		case !r.Success:
+			failures++
+		case r.Action == Pending:
+			pendings++
+			if !strings.Contains(r.Error, "NEWONE") {
+				t.Errorf("pending result should name the secret, got %q", r.Error)
+			}
+		case r.Action == Deleted:
+			deleted++
 		}
 	}
-	if gotSuccess != wantSuccess || gotFail != wantFail {
-		t.Fatalf("results breakdown success=%d fail=%d, want %d/%d", gotSuccess, gotFail, wantSuccess, wantFail)
+	if failures != 0 {
+		t.Errorf("a declared secret without a value must not be a failure (got %d failures)", failures)
+	}
+	if deleted != 1 || pendings != 1 {
+		t.Fatalf("results breakdown deleted=%d pending=%d, want 1/1", deleted, pendings)
 	}
 }
 
@@ -606,7 +653,7 @@ func TestDeployKeysLane_UpdateIsDeletePlusCreate(t *testing.T) {
 	defer rl.Stop()
 
 	cfg := &config.DeployKeysConfig{DeployKeys: []config.DeployKey{
-		{Title: "ci", Key: "ssh-ed25519 AAAA", ReadOnly: false}, // flip read_only
+		{Title: "ci", Key: "ssh-ed25519 AAAA", ReadOnly: config.Ptr(false)}, // flip read_only
 	}}
 	_, results, err := NewDeployKeysLane(cfg).Run(context.Background(), cl, config.Repo{Owner: "o", Name: "r"}, false)
 	if err != nil {

@@ -2,13 +2,13 @@ package applier
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 
 	"golang.org/x/sync/errgroup"
 
 	"github.com/Depthmark/repositories-settings/internal/config"
 	"github.com/Depthmark/repositories-settings/internal/diff"
+	"github.com/Depthmark/repositories-settings/internal/ghapi"
 	"github.com/Depthmark/repositories-settings/internal/ghclient"
 )
 
@@ -42,8 +42,10 @@ func NewRulesetsLane(cfg *config.RulesetsConfig) Lane {
 				for i, it := range items {
 					g.Go(func() error {
 						var full map[string]any
-						_, err := cl.DoREST(gctx, ghclient.PriorityCronReconcile, repo.Owner, http.MethodGet,
-							fmt.Sprintf("/repos/%s/%s/rulesets/%d", repo.Owner, repo.Name, it.ID), nil, &full)
+						_, err := cl.Do(gctx, ghclient.Call{
+							Prio: ghclient.PriorityCronReconcile, Owner: repo.Owner, Method: http.MethodGet,
+							Path: ghapi.RulesetsID(repo, it.ID), Route: ghapi.RouteRulesetsID, Out: &full,
+						})
 						if err != nil {
 							return err
 						}
@@ -65,18 +67,24 @@ func NewRulesetsLane(cfg *config.RulesetsConfig) Lane {
 			mutate := func(ctx context.Context, d diff.Diff) (Action, error) {
 				switch d.Action {
 				case diff.Create:
-					_, err := cl.DoREST(ctx, ghclient.PriorityMergeApply, repo.Owner, http.MethodPost,
-						fmt.Sprintf("/repos/%s/%s/rulesets", repo.Owner, repo.Name), d.Desired, nil)
+					_, err := cl.Do(ctx, ghclient.Call{
+						Prio: ghclient.PriorityMergeApply, Owner: repo.Owner, Method: http.MethodPost,
+						Path: ghapi.Rulesets(repo), Route: ghapi.RouteRulesets,
+						Body: map[string]any(ghapi.RulesetBody(d.Desired)),
+					})
 					return Created, err
 				case diff.Update:
-					id := intField(d.Current, "_id")
-					_, err := cl.DoREST(ctx, ghclient.PriorityMergeApply, repo.Owner, http.MethodPut,
-						fmt.Sprintf("/repos/%s/%s/rulesets/%d", repo.Owner, repo.Name, int(id)), d.Desired, nil)
+					_, err := cl.Do(ctx, ghclient.Call{
+						Prio: ghclient.PriorityMergeApply, Owner: repo.Owner, Method: http.MethodPut,
+						Path: ghapi.RulesetsID(repo, intField(d.Current, "_id")), Route: ghapi.RouteRulesetsID,
+						Body: map[string]any(ghapi.RulesetBody(d.Desired)),
+					})
 					return Updated, err
 				case diff.Delete:
-					id := intField(d.Current, "_id")
-					_, err := cl.DoREST(ctx, ghclient.PriorityMergeApply, repo.Owner, http.MethodDelete,
-						fmt.Sprintf("/repos/%s/%s/rulesets/%d", repo.Owner, repo.Name, int(id)), nil, nil)
+					_, err := cl.Do(ctx, ghclient.Call{
+						Prio: ghclient.PriorityMergeApply, Owner: repo.Owner, Method: http.MethodDelete,
+						Path: ghapi.RulesetsID(repo, intField(d.Current, "_id")), Route: ghapi.RouteRulesetsID,
+					})
 					return Deleted, err
 				}
 				return Skipped, nil

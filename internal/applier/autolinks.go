@@ -2,15 +2,17 @@ package applier
 
 import (
 	"context"
-	"fmt"
-	"net/http"
+
+	"github.com/google/go-github/v76/github"
 
 	"github.com/Depthmark/repositories-settings/internal/config"
 	"github.com/Depthmark/repositories-settings/internal/diff"
+	"github.com/Depthmark/repositories-settings/internal/ghapi"
 	"github.com/Depthmark/repositories-settings/internal/ghclient"
 )
 
-// Autolinks: GitHub doesn't support PATCH on autolinks, so update == delete + create.
+// Autolinks are keyed by key_prefix. GitHub has no update endpoint, so
+// changing one is a delete followed by a create.
 func NewAutolinksLane(cfg *config.AutolinksConfig) Lane {
 	if cfg == nil {
 		return Lane{}
@@ -18,64 +20,51 @@ func NewAutolinksLane(cfg *config.AutolinksConfig) Lane {
 	return Lane{
 		Resource: "autolinks",
 		Run: func(ctx context.Context, cl *ghclient.Client, repo config.Repo, dryRun bool) ([]diff.Diff, []Result, error) {
+			byPrefix := make(map[string]config.Autolink, len(cfg.Autolinks))
+			for _, a := range cfg.Autolinks {
+				byPrefix[a.KeyPrefix] = a
+			}
+
 			fetch := func(ctx context.Context) ([]map[string]any, error) {
-				type liveAuto struct {
-					ID             int    `json:"id"`
-					KeyPrefix      string `json:"key_prefix"`
-					URLTemplate    string `json:"url_template"`
-					IsAlphanumeric bool   `json:"is_alphanumeric"`
-				}
-				items, err := ghclient.Paginate[liveAuto](ctx, cl, ghclient.PriorityCronReconcile, repo.Owner,
-					fmt.Sprintf("/repos/%s/%s/autolinks", repo.Owner, repo.Name))
+				items, err := listAll(ctx, cl, repo, ghapi.RouteAutolinks,
+					func(ctx context.Context, opts *github.ListOptions) ([]*github.Autolink, *github.Response, error) {
+						return cl.GH().Repositories.ListAutolinks(ctx, repo.Owner, repo.Name, opts)
+					})
 				if err != nil {
 					return nil, err
 				}
-				out := make([]map[string]any, 0, len(items))
-				for _, a := range items {
-					out = append(out, map[string]any{
-						"_id":             a.ID,
-						"key_prefix":      a.KeyPrefix,
-						"url_template":    a.URLTemplate,
-						"is_alphanumeric": a.IsAlphanumeric,
-					})
-				}
-				return out, nil
+				return mapAll(items, ghapi.DecodeAutolink), nil
 			}
+
 			desired, err := diff.ToMaps(cfg.Autolinks)
 			if err != nil {
 				return nil, nil, err
 			}
+
+			create := func(ctx context.Context, prefix string) error {
+				_, _, err := cl.GH().Repositories.AddAutolink(
+					writeCtx(ctx, repo, ghapi.RouteAutolinks), repo.Owner, repo.Name,
+					ghapi.EncodeAutolink(byPrefix[prefix]))
+				return err
+			}
+			remove := func(ctx context.Context, id int64) error {
+				_, err := cl.GH().Repositories.DeleteAutolink(
+					writeCtx(ctx, repo, ghapi.RouteAutolinksID), repo.Owner, repo.Name, id)
+				return err
+			}
+
 			mutate := func(ctx context.Context, d diff.Diff) (Action, error) {
+				prefix := keyOf(d, "key_prefix")
 				switch d.Action {
 				case diff.Create:
-					payload := map[string]any{
-						"key_prefix":      stringField(d.Desired, "key_prefix"),
-						"url_template":    stringField(d.Desired, "url_template"),
-						"is_alphanumeric": d.Desired.(map[string]any)["is_alphanumeric"],
-					}
-					_, err := cl.DoREST(ctx, ghclient.PriorityMergeApply, repo.Owner, http.MethodPost,
-						fmt.Sprintf("/repos/%s/%s/autolinks", repo.Owner, repo.Name), payload, nil)
-					return Created, err
+					return Created, create(ctx, prefix)
 				case diff.Update:
-					// Delete then re-create.
-					id := intField(d.Current, "_id")
-					if _, err := cl.DoREST(ctx, ghclient.PriorityMergeApply, repo.Owner, http.MethodDelete,
-						fmt.Sprintf("/repos/%s/%s/autolinks/%d", repo.Owner, repo.Name, int(id)), nil, nil); err != nil {
+					if err := remove(ctx, int64(intField(d.Current, "_id"))); err != nil {
 						return Updated, err
 					}
-					payload := map[string]any{
-						"key_prefix":      stringField(d.Desired, "key_prefix"),
-						"url_template":    stringField(d.Desired, "url_template"),
-						"is_alphanumeric": d.Desired.(map[string]any)["is_alphanumeric"],
-					}
-					_, err := cl.DoREST(ctx, ghclient.PriorityMergeApply, repo.Owner, http.MethodPost,
-						fmt.Sprintf("/repos/%s/%s/autolinks", repo.Owner, repo.Name), payload, nil)
-					return Updated, err
+					return Updated, create(ctx, prefix)
 				case diff.Delete:
-					id := intField(d.Current, "_id")
-					_, err := cl.DoREST(ctx, ghclient.PriorityMergeApply, repo.Owner, http.MethodDelete,
-						fmt.Sprintf("/repos/%s/%s/autolinks/%d", repo.Owner, repo.Name, int(id)), nil, nil)
-					return Deleted, err
+					return Deleted, remove(ctx, int64(intField(d.Current, "_id")))
 				}
 				return Skipped, nil
 			}

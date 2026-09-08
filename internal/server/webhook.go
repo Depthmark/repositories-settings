@@ -31,7 +31,8 @@ type genericPayload struct {
 		Owner struct {
 			Login string `json:"login"`
 		} `json:"owner"`
-		Name string `json:"name"`
+		Name          string `json:"name"`
+		DefaultBranch string `json:"default_branch"`
 	} `json:"repository"`
 	PullRequest struct {
 		Number int `json:"number"`
@@ -66,7 +67,12 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = r.Body.Close() }()
 
-	if len(h.deps.WebhookSecret) > 0 {
+	if len(h.deps.WebhookSecret) == 0 {
+		if !h.deps.AllowUnauthenticated {
+			http.Error(w, "webhook authentication is not configured", http.StatusUnauthorized)
+			return
+		}
+	} else {
 		sig := r.Header.Get("X-Hub-Signature-256")
 		if !verifyHMAC(h.deps.WebhookSecret, body, sig) {
 			http.Error(w, "invalid signature", http.StatusUnauthorized)
@@ -101,20 +107,24 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handlePush reconciles on default-branch pushes (we don't filter by
-// branch here — the reconciler is idempotent and a push from a feature
-// branch still carries valuable signal for selective reconcile).
+// handlePush reconciles only when GitHub says the pushed ref is the
+// repository's default branch. Missing repository metadata fails safe.
 func (h *webhookHandler) handlePush(w http.ResponseWriter, ctx context.Context, repo config.Repo, p genericPayload) {
-	ref := ""
-	if strings.HasPrefix(p.Ref, "refs/heads/") {
-		ref = strings.TrimPrefix(p.Ref, "refs/heads/")
+	defaultBranch := strings.TrimSpace(p.Repository.DefaultBranch)
+	if defaultBranch == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"received": true, "skipped": "missing default branch"})
+		return
 	}
-	settings, err := h.deps.Settings(ctx, repo, ref)
+	if p.Ref != "refs/heads/"+defaultBranch {
+		writeJSON(w, http.StatusOK, map[string]any{"received": true, "skipped": "non-default branch"})
+		return
+	}
+	res, err := h.deps.Settings(ctx, repo, defaultBranch)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	rep, err := h.deps.Reconciler.Reconcile(ctx, h.deps.Client, repo, settings, config.TriggerPush, false, nil)
+	rep, err := reconcile(ctx, h.deps, repo, res, config.TriggerPush, false)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -134,12 +144,12 @@ func (h *webhookHandler) handlePullRequest(w http.ResponseWriter, ctx context.Co
 			writeJSON(w, http.StatusOK, map[string]any{"received": true, "skipped": "pr not merged"})
 			return
 		}
-		settings, err := h.deps.Settings(ctx, repo, "")
+		res, err := h.deps.Settings(ctx, repo, "")
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		rep, err := h.deps.Reconciler.Reconcile(ctx, h.deps.Client, repo, settings, config.TriggerWebhook, false, nil)
+		rep, err := reconcile(ctx, h.deps, repo, res, config.TriggerWebhook, false)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -192,13 +202,13 @@ func (h *webhookHandler) handleIssueComment(w http.ResponseWriter, ctx context.C
 			writeJSON(w, http.StatusOK, map[string]any{"received": true, "rejected": "unprivileged"})
 			return
 		}
-		settings, err := h.deps.Settings(ctx, repo, "")
+		res, err := h.deps.Settings(ctx, repo, "")
 		if err != nil {
 			h.commentError(ctx, repo, p.Issue.Number, "loading config", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		rep, err := h.deps.Reconciler.Reconcile(ctx, h.deps.Client, repo, settings, config.TriggerManual, false, nil)
+		rep, err := reconcile(ctx, h.deps, repo, res, config.TriggerManual, false)
 		if err != nil {
 			h.commentError(ctx, repo, p.Issue.Number, "reconcile", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -220,7 +230,7 @@ func (h *webhookHandler) runDryRunAndComment(
 	prNumber int,
 	headSHA string,
 ) {
-	settings, err := h.deps.Settings(ctx, repo, headSHA)
+	res, err := h.deps.Settings(ctx, repo, headSHA)
 	if err != nil {
 		// Configuration errors from the loader are the operator's
 		// problem to fix, so render them in the PR. Failures from
@@ -233,7 +243,9 @@ func (h *webhookHandler) runDryRunAndComment(
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	rep, err := h.deps.Reconciler.Reconcile(ctx, h.deps.Client, repo, settings, config.TriggerWebhook, true, nil)
+	// The reconciler serializes dry runs too: reading live state while an
+	// apply is half-written produces a diff against a state that never existed.
+	rep, err := reconcile(ctx, h.deps, repo, res, config.TriggerWebhook, true)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

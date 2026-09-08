@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"strings"
 
 	"github.com/Depthmark/repositories-settings/internal/applier"
 	"github.com/Depthmark/repositories-settings/internal/config"
@@ -29,8 +28,8 @@ type reconcileRequest struct {
 }
 
 func (h *reconcileHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if !authorize(r, h.deps) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	c, ok := requireCaller(w, r, h.deps)
+	if !ok {
 		return
 	}
 	var req reconcileRequest
@@ -43,21 +42,32 @@ func (h *reconcileHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	repo := config.Repo{Owner: req.Owner, Name: req.Repo}
-	settings, err := h.deps.Settings(r.Context(), repo, "")
+	// An OIDC caller may only reconcile the repository whose workflow
+	// minted its token, so the scope check waits for the target.
+	if !requireScope(w, r, h.deps, c, repo) {
+		return
+	}
+	if !req.DryRun && !requireApply(w, r, h.deps, c, repo) {
+		return
+	}
+	res, err := h.deps.Settings(r.Context(), repo, "")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	if req.ChangedFiles != nil {
-		if keys := config.AffectedKeys(req.ChangedFiles); keys != nil {
-			settings = config.Filter(settings, keys)
-		}
+		res = res.Filtering(config.AffectedKeys(req.ChangedFiles))
 	}
-	rep, err := h.deps.Reconciler.Reconcile(r.Context(), h.deps.Client, repo, settings, config.TriggerManual, req.DryRun, nil)
+	rep, err := reconcile(r.Context(), h.deps, repo, res, config.TriggerManual, req.DryRun)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// Populate the rendered summary so workflow consumers can write it
+	// straight to $GITHUB_STEP_SUMMARY without re-implementing the
+	// formatter. The same string powers /api/check's top-level summary
+	// field; here we hang it off the Report.
+	rep.Summary = formatReport(rep)
 	writeJSON(w, http.StatusOK, rep)
 }
 
@@ -87,8 +97,8 @@ type checkResponse struct {
 //   - "failure" — at least one lane errored during the dry-run (e.g. invalid
 //     config, missing permissions). The workflow exits non-zero on this.
 func (h *checkHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if !authorize(r, h.deps) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	c, ok := requireCaller(w, r, h.deps)
+	if !ok {
 		return
 	}
 	var req checkRequest
@@ -101,13 +111,16 @@ func (h *checkHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	repo := config.Repo{Owner: req.Owner, Name: req.Repo}
-	settings, err := h.deps.Settings(r.Context(), repo, req.HeadSHA)
+	if !requireScope(w, r, h.deps, c, repo) {
+		return
+	}
+	res, err := h.deps.Settings(r.Context(), repo, req.HeadSHA)
 	if err != nil {
 		metrics.PRCheckTotal.WithLabelValues("failure").Inc()
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	rep, err := h.deps.Reconciler.Reconcile(r.Context(), h.deps.Client, repo, settings, config.TriggerWebhook, true, nil)
+	rep, err := reconcile(r.Context(), h.deps, repo, res, config.TriggerWebhook, true)
 	if err != nil {
 		metrics.PRCheckTotal.WithLabelValues("failure").Inc()
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -230,6 +243,15 @@ func (h *validateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// A validation endpoint that answers 200 for invalid input makes
+	// every caller parse the body to find out. 422 says "well-formed
+	// request, unprocessable content", which is what a schema failure
+	// is, and lets a workflow branch on the status line.
+	status := http.StatusOK
+	if !out.Valid {
+		status = http.StatusUnprocessableEntity
+	}
+
 	// Annotate each file with any operator-disabled resources it
 	// configures. We do this after structural validation so a syntactically
 	// broken file still gets its `issues`, plus the disabled warning if
@@ -248,17 +270,5 @@ func (h *validateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	writeJSON(w, http.StatusOK, out)
-}
-
-func authorize(r *http.Request, d Deps) bool {
-	if d.APIToken == "" {
-		return true
-	}
-	auth := r.Header.Get("Authorization")
-	const prefix = "Bearer "
-	if !strings.HasPrefix(auth, prefix) {
-		return false
-	}
-	return auth[len(prefix):] == d.APIToken
+	writeJSON(w, status, out)
 }

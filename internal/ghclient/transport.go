@@ -11,9 +11,9 @@ import (
 // cached body when the server replies 304 Not Modified. Replaces the
 // stand-alone ETag wrapper from the TS code.
 //
-// Writes invalidate any cached read whose URL path is a prefix of the
-// write target — so a PATCH /repos/x/y/topics clears the cached
-// /repos/x/y/topics GET response.
+// A successful write invalidates every cached read on a related path:
+// the write target itself, anything beneath it, and the collection a
+// written item belongs to. See etagCache.InvalidatePath.
 type conditionalGetTransport struct {
 	next  http.RoundTripper
 	cache *etagCache
@@ -30,7 +30,7 @@ func (t *conditionalGetTransport) RoundTrip(req *http.Request) (*http.Response, 
 	if req.Method != http.MethodGet {
 		resp, err := t.next.RoundTrip(req)
 		if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			t.cache.InvalidatePrefix(req.URL.Path)
+			t.cache.InvalidatePath(req.URL.Path)
 		}
 		return resp, err
 	}
@@ -73,7 +73,7 @@ func (t *conditionalGetTransport) RoundTrip(req *http.Request) (*http.Response, 
 			if err != nil {
 				return nil, err
 			}
-			t.cache.Set(key, etagEntry{etag: etag, body: body})
+			t.cache.Set(key, etagEntry{etag: etag, body: body, path: req.URL.Path})
 			resp.Body = io.NopCloser(bytes.NewReader(body))
 		}
 	}

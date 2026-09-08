@@ -3,11 +3,13 @@ package applier
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"sort"
+
+	"github.com/google/go-github/v76/github"
 
 	"github.com/Depthmark/repositories-settings/internal/config"
 	"github.com/Depthmark/repositories-settings/internal/diff"
+	"github.com/Depthmark/repositories-settings/internal/ghapi"
 	"github.com/Depthmark/repositories-settings/internal/ghclient"
 )
 
@@ -40,13 +42,65 @@ type liveRepo struct {
 }
 
 // PrefetchedRepo is the subset of repo state the cron worker can fetch
-// in batch via GraphQL. Passing it skips the REST GET in the lane.
+// in batch via GraphQL. Passing it lets the lane skip the REST GET —
+// but only when it can answer everything the repository configures.
+// See prefetchedRepoFields.
 type PrefetchedRepo struct {
 	Description, Homepage                           string
 	Private, Archived                               bool
 	HasIssues, HasProjects, HasWiki, HasDiscussions bool
 	IsTemplate                                      bool
 	Topics                                          []string
+	// TopicsComplete is false when the batch query truncated the topic
+	// list. A truncated list would be diffed as "these topics were
+	// removed", so the lane falls back to REST instead.
+	TopicsComplete bool
+}
+
+// prefetchedRepoFields are the liveRepo JSON keys the cron batch GraphQL
+// query populates. The batch document is a strict subset of the REST one:
+// every other key would arrive as its zero value, and because the diff is
+// one-sided against desired, a configured allow_squash_merge: true would
+// read as drift from false and be rewritten on every cron pass.
+var prefetchedRepoFields = map[string]bool{
+	"description":     true,
+	"homepage":        true,
+	"private":         true,
+	"archived":        true,
+	"has_issues":      true,
+	"has_projects":    true,
+	"has_wiki":        true,
+	"has_discussions": true,
+	"is_template":     true,
+	"topics":          true,
+}
+
+// prefetchCovers reports whether the batch record can answer every field
+// the repository configures.
+func prefetchCovers(desired map[string]any) bool {
+	for k := range desired {
+		if !prefetchedRepoFields[k] {
+			return false
+		}
+	}
+	return true
+}
+
+// liveRepoFrom narrows a prefetched batch record to the live document
+// shape. Only the fields in prefetchedRepoFields are populated.
+func liveRepoFrom(p *PrefetchedRepo) liveRepo {
+	return liveRepo{
+		Description:    p.Description,
+		Homepage:       p.Homepage,
+		Private:        p.Private,
+		Archived:       p.Archived,
+		HasIssues:      p.HasIssues,
+		HasProjects:    p.HasProjects,
+		HasWiki:        p.HasWiki,
+		HasDiscussions: p.HasDiscussions,
+		IsTemplate:     p.IsTemplate,
+		Topics:         p.Topics,
+	}
 }
 
 // NewRepoLane builds the Phase A applier (repo settings + topics).
@@ -57,35 +111,34 @@ func NewRepoLane(cfg *config.Settings, prefetched *PrefetchedRepo) Lane {
 			if cfg.Repo == nil && cfg.Topics == nil {
 				return nil, nil, nil
 			}
-			var live liveRepo
-			if prefetched != nil {
-				live = liveRepo{
-					Description:    prefetched.Description,
-					Homepage:       prefetched.Homepage,
-					Private:        prefetched.Private,
-					Archived:       prefetched.Archived,
-					HasIssues:      prefetched.HasIssues,
-					HasProjects:    prefetched.HasProjects,
-					HasWiki:        prefetched.HasWiki,
-					HasDiscussions: prefetched.HasDiscussions,
-					IsTemplate:     prefetched.IsTemplate,
-					Topics:         prefetched.Topics,
+
+			// Desired first: which fields are configured decides whether
+			// the cron worker's partial record is usable at all.
+			var desired map[string]any
+			if cfg.Repo != nil {
+				var err error
+				desired, err = diff.ToMap(cfg.Repo)
+				if err != nil {
+					return nil, nil, err
 				}
+			}
+
+			var live liveRepo
+			if usablePrefetch(prefetched, desired, cfg.Topics != nil) {
+				live = liveRepoFrom(prefetched)
 			} else {
-				if _, err := cl.DoREST(ctx, ghclient.PriorityCronReconcile, repo.Owner, http.MethodGet,
-					fmt.Sprintf("/repos/%s/%s", repo.Owner, repo.Name), nil, &live); err != nil {
+				r, _, err := cl.GH().Repositories.Get(
+					readCtx(ctx, repo, ghapi.RouteRepo), repo.Owner, repo.Name)
+				if err != nil {
 					return nil, nil, fmt.Errorf("get repo: %w", err)
 				}
+				live = repoFromSDK(r)
 			}
 
 			var diffs []diff.Diff
 			var applied []Result
 
 			if cfg.Repo != nil {
-				desired, err := diff.ToMap(cfg.Repo)
-				if err != nil {
-					return nil, nil, err
-				}
 				liveMap, _ := diff.ToMap(live)
 				// Restrict liveMap to keys present in desired so we only
 				// diff managed fields (matches TS behaviour).
@@ -100,8 +153,9 @@ func NewRepoLane(cfg *config.Settings, prefetched *PrefetchedRepo) Lane {
 					for _, ch := range d.Changes {
 						patch[ch.Path] = ch.To
 					}
-					_, err := cl.DoREST(ctx, ghclient.PriorityMergeApply, repo.Owner, http.MethodPatch,
-						fmt.Sprintf("/repos/%s/%s", repo.Owner, repo.Name), patch, nil)
+					_, _, err := cl.GH().Repositories.Edit(
+						writeCtx(ctx, repo, ghapi.RouteRepo), repo.Owner, repo.Name,
+						ghapi.EncodeRepoPatch(patch))
 					if err != nil {
 						applied = append(applied, failure("repository", Updated, err, 1))
 					} else {
@@ -120,9 +174,8 @@ func NewRepoLane(cfg *config.Settings, prefetched *PrefetchedRepo) Lane {
 					map[string]any{"names": des})
 				diffs = append(diffs, d)
 				if !dryRun && d.Action != diff.Noop {
-					body := map[string]any{"names": des}
-					_, err := cl.DoREST(ctx, ghclient.PriorityMergeApply, repo.Owner, http.MethodPut,
-						fmt.Sprintf("/repos/%s/%s/topics", repo.Owner, repo.Name), body, nil)
+					_, _, err := cl.GH().Repositories.ReplaceAllTopics(
+						writeCtx(ctx, repo, ghapi.RouteRepoTopics), repo.Owner, repo.Name, des)
 					if err != nil {
 						applied = append(applied, failure("topics", Updated, err, 1))
 					} else {
@@ -133,5 +186,55 @@ func NewRepoLane(cfg *config.Settings, prefetched *PrefetchedRepo) Lane {
 
 			return diffs, applied, nil
 		},
+	}
+}
+
+// usablePrefetch reports whether the cron worker's batch record is a
+// complete answer for this repository's configuration. It is not enough
+// that a record exists: the batch query fetches a subset of the fields
+// and a bounded page of topics, and diffing against what it did not
+// fetch reports drift that is not there.
+func usablePrefetch(p *PrefetchedRepo, desired map[string]any, wantTopics bool) bool {
+	if p == nil {
+		return false
+	}
+	if !prefetchCovers(desired) {
+		return false
+	}
+	if wantTopics && !p.TopicsComplete {
+		return false
+	}
+	return true
+}
+
+// repoFromSDK narrows a go-github Repository to the fields this service
+// manages. The SDK type carries well over a hundred fields; the diff is
+// one-sided so extras would be harmless, but narrowing keeps the live
+// document the same shape as the desired one and makes the comparison
+// readable in a report.
+func repoFromSDK(r *github.Repository) liveRepo {
+	return liveRepo{
+		Description:              r.GetDescription(),
+		Homepage:                 r.GetHomepage(),
+		Private:                  r.GetPrivate(),
+		Visibility:               r.GetVisibility(),
+		HasIssues:                r.GetHasIssues(),
+		HasProjects:              r.GetHasProjects(),
+		HasWiki:                  r.GetHasWiki(),
+		HasDiscussions:           r.GetHasDiscussions(),
+		IsTemplate:               r.GetIsTemplate(),
+		AllowSquashMerge:         r.GetAllowSquashMerge(),
+		AllowMergeCommit:         r.GetAllowMergeCommit(),
+		AllowRebaseMerge:         r.GetAllowRebaseMerge(),
+		AllowAutoMerge:           r.GetAllowAutoMerge(),
+		DeleteBranchOnMerge:      r.GetDeleteBranchOnMerge(),
+		AllowUpdateBranch:        r.GetAllowUpdateBranch(),
+		SquashMergeCommitTitle:   r.GetSquashMergeCommitTitle(),
+		SquashMergeCommitMessage: r.GetSquashMergeCommitMessage(),
+		MergeCommitTitle:         r.GetMergeCommitTitle(),
+		MergeCommitMessage:       r.GetMergeCommitMessage(),
+		Archived:                 r.GetArchived(),
+		WebCommitSignoffRequired: r.GetWebCommitSignoffRequired(),
+		Topics:                   r.Topics,
 	}
 }

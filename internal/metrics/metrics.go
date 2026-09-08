@@ -48,9 +48,9 @@ var (
 	APICallsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "api_calls_total",
-			Help: "GitHub API calls grouped by method, endpoint and status.",
+			Help: "GitHub API calls grouped by method, route template and status.",
 		},
-		[]string{"method", "endpoint", "status"},
+		[]string{"method", "route", "status"},
 	)
 	WebhookEventsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -69,9 +69,30 @@ var (
 	PolicyViolationsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "policy_violations_total",
-			Help: "Admin policy violations grouped by severity and field.",
+			Help: "Admin policy violations grouped by severity and resource group.",
 		},
+		// The label is the resource group ("teams", "rulesets"), never
+		// the full field path: that carries user-chosen team slugs and
+		// ruleset names, and one repository could otherwise blow up the
+		// cardinality of this series for the whole deployment.
 		[]string{"severity", "field"},
+	)
+	OIDCValidationsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "oidc_validations_total",
+			Help: "OIDC bearer token validations grouped by issuer and result.",
+		},
+		// Both labels are bounded: issuer by the configured allowlist
+		// (with "unknown"/"untrusted" for tokens that never reached it),
+		// result by a fixed set of failure classes.
+		[]string{"issuer", "result"},
+	)
+	AuthorizationsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "api_authorizations_total",
+			Help: "Privileged API authorization outcomes grouped by credential kind and result.",
+		},
+		[]string{"kind", "result"},
 	)
 )
 
@@ -90,6 +111,8 @@ func Register(r prometheus.Registerer) {
 		WebhookEventsTotal,
 		PRCheckTotal,
 		PolicyViolationsTotal,
+		OIDCValidationsTotal,
+		AuthorizationsTotal,
 	)
 }
 

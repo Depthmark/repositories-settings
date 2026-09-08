@@ -128,9 +128,9 @@ func TestFormatMarkdown_AllNoopShowsOnlyUnchangedDetails(t *testing.T) {
 		}
 	}
 	for _, unwanted := range []string{
-		"### ➕ Add",
-		"### ✏️ Modify",
-		"### ➖ Remove",
+		"<summary>➕ Add",
+		"<summary>✏️ Modify",
+		"<summary>➖ Remove",
 	} {
 		if strings.Contains(out, unwanted) {
 			t.Errorf("zero-count section should be omitted but found %q:\n%s", unwanted, out)
@@ -153,9 +153,9 @@ func TestFormatMarkdown_SectionOrderRiskDescending(t *testing.T) {
 	for _, want := range []string{
 		"4 resource(s) inspected",
 		"1 add · 1 modify · 1 remove · 1 unchanged",
-		"### ➖ Remove (1)",
-		"### ✏️ Modify (1)",
-		"### ➕ Add (1)",
+		"<summary>➖ Remove (1)",
+		"<summary>✏️ Modify (1)",
+		"<summary>➕ Add (1)",
 		"teams.zeta",
 		"teams.alpha",
 		"teams.beta",
@@ -166,11 +166,11 @@ func TestFormatMarkdown_SectionOrderRiskDescending(t *testing.T) {
 		}
 	}
 
-	r := strings.Index(out, "### ➖ Remove")
-	m := strings.Index(out, "### ✏️ Modify")
-	a := strings.Index(out, "### ➕ Add")
+	r := strings.Index(out, "<summary>➖ Remove")
+	m := strings.Index(out, "<summary>✏️ Modify")
+	a := strings.Index(out, "<summary>➕ Add")
 	u := strings.Index(out, "<details>") // unchanged is wrapped
-	if !(r < m && m < a && a < u) {
+	if r >= m || m >= a || a >= u {
 		t.Fatalf("section order broken (Remove<Modify<Add<Unchanged): r=%d m=%d a=%d u=%d", r, m, a, u)
 	}
 }
@@ -182,12 +182,12 @@ func TestFormatMarkdown_EmptySectionsAreOmitted(t *testing.T) {
 	out := FormatMarkdown([]Diff{
 		{Resource: "teams.x", Action: Create, Changes: []FieldChange{{Path: "permission", From: nil, To: "push"}}},
 	})
-	if !strings.Contains(out, "### ➕ Add (1)") {
+	if !strings.Contains(out, "<summary>➕ Add (1)") {
 		t.Errorf("Add section missing:\n%s", out)
 	}
 	for _, unwanted := range []string{
-		"### ✏️ Modify",
-		"### ➖ Remove",
+		"<summary>✏️ Modify",
+		"<summary>➖ Remove",
 		"_None._",
 	} {
 		if strings.Contains(out, unwanted) {
@@ -208,7 +208,7 @@ func TestFormatMarkdown_StableOrderingWithinSection(t *testing.T) {
 	a := strings.Index(out, "teams.alpha")
 	b := strings.Index(out, "teams.beta")
 	z := strings.Index(out, "teams.zeta")
-	if !(a < b && b < z) {
+	if a >= b || b >= z {
 		t.Fatalf("expected alphabetical order within Add section, got:\n%s", out)
 	}
 }
@@ -262,7 +262,7 @@ func TestFormatMarkdown_DropsIdentityRowsOnAdd(t *testing.T) {
 			}},
 		{Resource: "teams.platform", Action: Create,
 			Changes: []FieldChange{
-				{Path: "slug", From: nil, To: "platform"},  // drop
+				{Path: "slug", From: nil, To: "platform"},    // drop
 				{Path: "permission", From: nil, To: "admin"}, // keep
 			}},
 	})
@@ -331,5 +331,55 @@ func TestToMapStruct(t *testing.T) {
 	}
 	if m["a"].(float64) != 1 || m["b"] != "x" {
 		t.Fatalf("got %+v", m)
+	}
+}
+
+// A JSON round-trip widens every number to float64, so an int desired
+// value and a float64 live value describe the same setting. Everything
+// else keeps its type: string "true" is not boolean true, and string "1"
+// is not the number 1. Coercing those was how a repository whose live
+// state had drifted to a string reported "no changes".
+func TestFields_TypedDriftIsNotCoerced(t *testing.T) {
+	t.Run("numeric widening is equal", func(t *testing.T) {
+		changes := Fields(
+			map[string]any{"required_approvals": float64(2), "days": int64(7)},
+			map[string]any{"required_approvals": 2, "days": 7.0},
+			"",
+		)
+		if len(changes) != 0 {
+			t.Fatalf("numeric widening should not be drift, got %+v", changes)
+		}
+	})
+
+	t.Run("large adjacent integers remain different", func(t *testing.T) {
+		changes := Fields(
+			map[string]any{"id": int64(9007199254740993)},
+			map[string]any{"id": uint64(9007199254740992)},
+			"",
+		)
+		if len(changes) != 1 {
+			t.Fatalf("numeric normalization hid large-integer drift: %+v", changes)
+		}
+	})
+
+	for _, tc := range []struct {
+		name       string
+		live, want any
+	}{
+		{"string vs bool", "true", true},
+		{"string vs number", "1", 1},
+		{"number vs bool", 1, true},
+		{"bool vs string", false, "false"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			changes := Fields(
+				map[string]any{"k": tc.live},
+				map[string]any{"k": tc.want},
+				"",
+			)
+			if len(changes) != 1 {
+				t.Fatalf("expected drift between %#v and %#v, got %+v", tc.live, tc.want, changes)
+			}
+		})
 	}
 }

@@ -17,6 +17,7 @@ package diff
 import (
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"reflect"
 	"sort"
 )
@@ -262,10 +263,41 @@ func slicesEqualByJSON(a, b any) bool {
 	return string(ab) == string(bb)
 }
 
+// valuesEqual compares one live value against one desired value.
+//
+// The only coercion is numeric: a JSON round-trip widens every number to
+// float64, so live 1.0 and desired 1 describe the same setting. Nothing
+// else is coerced. Comparing the rendered strings — the previous
+// behaviour — made "true" equal true and "1" equal 1, which silently
+// swallowed exactly the typed drift this package exists to report.
 func valuesEqual(a, b any) bool {
 	if a == nil || b == nil {
-		return a == b
+		return a == nil && b == nil
 	}
-	// Numbers from JSON unmarshal arrive as float64; tolerate that.
-	return reflect.DeepEqual(a, b) || fmt.Sprint(a) == fmt.Sprint(b)
+	ar, aNum := numeric(a)
+	br, bNum := numeric(b)
+	if aNum || bNum {
+		// SetFloat64 returns nil for NaN and infinities. Those values cannot
+		// occur in JSON configuration, and treating them as unequal avoids
+		// manufacturing equality for an invalid numeric value.
+		return aNum && bNum && ar != nil && br != nil && ar.Cmp(br) == 0
+	}
+	return reflect.DeepEqual(a, b)
+}
+
+// numeric converts any Go numeric kind to its exact rational value.
+// Using float64 as the common type would make adjacent integers above
+// 2^53 compare equal. Strings and bools are deliberately excluded: they
+// are the coercions that hid drift.
+func numeric(v any) (*big.Rat, bool) {
+	switch rv := reflect.ValueOf(v); rv.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return new(big.Rat).SetInt64(rv.Int()), true
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return new(big.Rat).SetInt(new(big.Int).SetUint64(rv.Uint())), true
+	case reflect.Float32, reflect.Float64:
+		return new(big.Rat).SetFloat64(rv.Float()), true
+	default:
+		return nil, false
+	}
 }

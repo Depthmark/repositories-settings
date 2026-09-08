@@ -22,6 +22,11 @@ type BatchedRepoState struct {
 	HasDiscussions bool
 	IsTemplate     bool
 	Topics         []string
+	// TopicsComplete is false when the repository has more topics than
+	// the query asked for. A truncated list must not be diffed against
+	// desired topics: the reconcile would read the missing ones as
+	// removals and delete them.
+	TopicsComplete bool
 }
 
 // FetchBatchRepoSettings queries the given repos in a single GraphQL
@@ -60,7 +65,10 @@ func (c *Client) fetchBatchChunk(ctx context.Context, repos []config.Repo, out m
     hasProjectsEnabled
     hasDiscussionsEnabled
     isTemplate
-    repositoryTopics(first: 20) { nodes { topic { name } } }
+    repositoryTopics(first: 100) {
+      nodes { topic { name } }
+      pageInfo { hasNextPage }
+    }
   }`+"\n", i, r.Owner, r.Name)
 	}
 	b.WriteString("}\n")
@@ -81,6 +89,9 @@ func (c *Client) fetchBatchChunk(ctx context.Context, repos []config.Repo, out m
 					Name string `json:"name"`
 				} `json:"topic"`
 			} `json:"nodes"`
+			PageInfo struct {
+				HasNextPage bool `json:"hasNextPage"`
+			} `json:"pageInfo"`
 		} `json:"repositoryTopics"`
 	}
 	rawData := map[string]*repoNode{}
@@ -109,6 +120,7 @@ func (c *Client) fetchBatchChunk(ctx context.Context, repos []config.Repo, out m
 			HasDiscussions: n.HasDiscussionsEnabled,
 			IsTemplate:     n.IsTemplate,
 			Topics:         topics,
+			TopicsComplete: !n.RepositoryTopics.PageInfo.HasNextPage,
 		}
 	}
 	return nil

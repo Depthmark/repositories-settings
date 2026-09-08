@@ -7,17 +7,22 @@
 #   2. workflow_dispatch — a maintainer can manually request a dry-run
 #      or a real apply against the default branch.
 #
-# Required repo secrets:
+# Before enabling this static-token example, create the repo-settings
+# environment with required reviewers and trusted deployment branches.
+# Store these environment secrets there:
 #   REPO_SETTINGS_URL    — base URL of the repo-settings service
 #                          (e.g. https://repo-settings.example.com)
 #   REPO_SETTINGS_TOKEN  — value of API_TOKEN configured on the service
+# This token is operator-wide. Prefer the OIDC reusable workflow for
+# repository-scoped credentials without a shared service secret.
 #
 # Note on the App webhook: if your org has the repo-settings GitHub App
 # installed, it already posts a sticky PR comment on PR open / sync.
 # Running this workflow in addition produces TWO comments per PR (the
-# stickies use different markers and don't collide). Pick one source of
-# truth — either uninstall the App on these repos or remove this
-# workflow — to avoid that duplication.
+# stickies use different markers and don't collide). Omit this workflow
+# when the App webhook already supplies the desired checks and comments.
+# Keep the App installed: the service needs its installation credentials
+# to read repository settings and apply changes.
 
 name: repo-settings
 
@@ -37,19 +42,27 @@ on:
           - dry-run
           - apply
 
-permissions:
-  contents: read
-  pull-requests: write
+# Declared per job, not workflow-wide: only the PR job posts a comment,
+# and the manual job has no reason to hold write access to pull requests.
+permissions: {}
+
+concurrency:
+  group: repo-settings-example-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # PR dry-run: read-only, posts the sticky diff comment.
   # Skips fork PRs because secrets aren't injected for them; the App
   # webhook is the right place to validate fork contributions.
   pr-check:
+    name: Check proposed settings
     if: |
       github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    environment: repo-settings
+    permissions:
+      pull-requests: write  # Upsert the sticky dry-run comment
     steps:
       - name: Call /api/check
         id: check
@@ -68,28 +81,26 @@ jobs:
             --arg sha   "$HEAD_SHA" \
             --argjson pr "$PR" \
             '{owner:$owner, repo:$repo, head_sha:$sha, pr_number:$pr}')
-          curl -sS -X POST "$URL/api/check" \
+          curl -sS --fail-with-body -X POST "$URL/api/check" \
             -H "Authorization: Bearer $TOKEN" \
             -H "Content-Type: application/json" \
             --data "$payload" \
             -o /tmp/check.json
-          echo "conclusion=$(jq -r .conclusion /tmp/check.json)" >> "$GITHUB_OUTPUT"
+          conclusion=$(jq -er '.conclusion | select(. == "success" or . == "neutral" or . == "failure")' /tmp/check.json)
+          echo "conclusion=${conclusion}" >> "$GITHUB_OUTPUT"
+          # Keep server-rendered Markdown out of the output command file.
           {
-            echo 'summary<<REPO_SETTINGS_EOF'
+            printf '## repo-settings - dry run (%s)\n\n' "$conclusion"
             jq -r .summary /tmp/check.json
-            echo REPO_SETTINGS_EOF
-          } >> "$GITHUB_OUTPUT"
+            printf '\n<sub>Run: [%s](%s/%s/actions/runs/%s)</sub>\n' \
+              "$GITHUB_RUN_ID" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+          } > /tmp/check.md
 
       - name: Upsert sticky PR comment
-        uses: marocchino/sticky-pull-request-comment@v2
+        uses: marocchino/sticky-pull-request-comment@773744901bac0e8cbb5a0dc842800d45e9b2b405 # v2.9.4
         with:
           header: repo-settings-check
-          message: |
-            ## repo-settings — dry run (`${{ steps.check.outputs.conclusion }}`)
-
-            ${{ steps.check.outputs.summary }}
-
-            <sub>Run: [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})</sub>
+          path: /tmp/check.md
 
       - name: Fail the check on a lane error
         if: steps.check.outputs.conclusion == 'failure'
@@ -101,8 +112,13 @@ jobs:
   # dispatch the workflow, so an "apply" choice is already gated on the
   # same permission as `@repo-settings apply` from a PR comment.
   manual:
-    if: github.event_name == 'workflow_dispatch'
+    name: Reconcile default-branch settings
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
+    environment: repo-settings
+    permissions: {}
     steps:
       - name: Call /api/reconcile
         env:
@@ -110,6 +126,7 @@ jobs:
           TOKEN: ${{ secrets.REPO_SETTINGS_TOKEN }}
           OWNER: ${{ github.repository_owner }}
           REPO: ${{ github.event.repository.name }}
+          MODE: ${{ inputs.mode }}
           DRY_RUN: ${{ inputs.mode == 'dry-run' }}
         run: |
           set -euo pipefail
@@ -118,12 +135,12 @@ jobs:
             --arg repo  "$REPO" \
             --argjson dry "$DRY_RUN" \
             '{owner:$owner, repo:$repo, dry_run:$dry}')
-          curl -sS -X POST "$URL/api/reconcile" \
+          curl -sS --fail-with-body -X POST "$URL/api/reconcile" \
             -H "Authorization: Bearer $TOKEN" \
             -H "Content-Type: application/json" \
             --data "$payload" \
             -o /tmp/reconcile.json
-          echo "## repo-settings — ${{ inputs.mode }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "## repo-settings — ${MODE}" >> "$GITHUB_STEP_SUMMARY"
           jq -r '
             "Applied \(.applied | length) result(s); failures: \([.applied[] | select(.success==false)] | length)"
           ' /tmp/reconcile.json >> "$GITHUB_STEP_SUMMARY"

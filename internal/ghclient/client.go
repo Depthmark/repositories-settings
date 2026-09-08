@@ -21,17 +21,28 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/google/go-github/v76/github"
+
 	"github.com/Depthmark/repositories-settings/internal/config"
-	"github.com/Depthmark/repositories-settings/internal/metrics"
+	"github.com/Depthmark/repositories-settings/internal/ghapi"
 )
 
-// Client is the high-level GitHub client.
+// Client owns the GitHub connection: the transport chain (rate limit →
+// conditional GET → auth → metrics), a go-github client mounted on top
+// of it, and the per-repo lock.
+//
+// Callers reach GitHub through GH(), the go-github client. Every request
+// it makes inherits the transport chain, so the SDK gets the two-pool
+// rate limiter, the ETag cache and installation-token auth without
+// knowing they exist. Annotate the context with WithCall first so those
+// layers know the priority, the owner and the route template.
 type Client struct {
 	auth     *AppAuth
 	apiURL   string
 	limiter  *RateLimiter
 	cache    *etagCache
 	core     *http.Client
+	gh       *github.Client
 	logger   *slog.Logger
 	repoLock *RepoLock
 }
@@ -49,25 +60,34 @@ type Config struct {
 func New(cfg Config) *Client {
 	apiURL := cfg.APIURL
 	if apiURL == "" {
-		apiURL = "https://api.github.com"
+		apiURL = defaultAPIURL
 	}
 	httpc := cfg.HTTPClient
 	if httpc == nil {
 		httpc = http.DefaultClient
 	}
-	cache := newETagCache(cfg.CacheCap)
-	// Wrap base transport with conditional GET; rate limit observation
-	// happens inside DoREST after the request returns.
 	base := httpc.Transport
 	if base == nil {
 		base = http.DefaultTransport
 	}
-	wrapped := newConditionalGetTransport(base, cache)
-	httpc = &http.Client{
-		Transport: wrapped,
-		Timeout:   httpc.Timeout,
+	cache := newETagCache(cfg.CacheCap)
+
+	// Outermost first. Auth sits below the cache so a cached body costs
+	// nothing in token minting, and above metrics so the counter sees
+	// the request that actually went out.
+	chain := &rateLimitTransport{
+		rl: cfg.Limiter,
+		next: newConditionalGetTransport(
+			&authTransport{
+				auth: cfg.Auth,
+				next: &metricsTransport{next: base},
+			},
+			cache,
+		),
 	}
-	return &Client{
+	httpc = &http.Client{Transport: chain, Timeout: httpc.Timeout}
+
+	c := &Client{
 		auth:     cfg.Auth,
 		apiURL:   strings.TrimRight(apiURL, "/"),
 		limiter:  cfg.Limiter,
@@ -76,7 +96,41 @@ func New(cfg Config) *Client {
 		logger:   cfg.Logger,
 		repoLock: NewRepoLock(),
 	}
+	c.gh = newGitHubClient(httpc, c.apiURL)
+	return c
 }
+
+const defaultAPIURL = "https://api.github.com"
+
+// newGitHubClient mounts go-github on our transport chain.
+//
+// The base URL is taken literally from GITHUB_API_URL rather than going
+// through WithEnterpriseURLs, which derives the API root by appending
+// /api/v3/ to a server root. Deriving it would make the SDK and the raw
+// client disagree about where the API lives — the raw path just
+// concatenates GITHUB_API_URL — and two different notions of the base
+// URL in one process is a debugging problem nobody should inherit.
+// Enterprise operators point GITHUB_API_URL at the full API root, the
+// same value the raw path already expects.
+func newGitHubClient(httpc *http.Client, apiURL string) *github.Client {
+	gh := github.NewClient(httpc)
+	// go-github resolves paths against BaseURL, which must end in a slash.
+	base, err := url.Parse(strings.TrimRight(apiURL, "/") + "/")
+	if err != nil {
+		// Only a malformed GITHUB_API_URL reaches here; failing calls
+		// against the default host is a better outcome at startup than
+		// a nil client.
+		return gh
+	}
+	gh.BaseURL = base
+	gh.UploadURL = base
+	return gh
+}
+
+// GH returns the go-github client. Annotate ctx with WithCall before
+// using it so the transport chain can schedule, authenticate and label
+// the request.
+func (c *Client) GH() *github.Client { return c.gh }
 
 // RepoLock returns the per-repo serializer.
 func (c *Client) RepoLock() *RepoLock { return c.repoLock }
@@ -84,12 +138,44 @@ func (c *Client) RepoLock() *RepoLock { return c.repoLock }
 // Limiter returns the rate limiter (mostly for tests / metrics handlers).
 func (c *Client) Limiter() *RateLimiter { return c.limiter }
 
-// DoREST runs an authenticated REST request through the rate limiter
-// and decodes the response into out (pass nil to skip).
+// Call describes one REST request.
+//
+// Route is the low-cardinality path template
+// ("/repos/{owner}/{repo}/hooks/{hook_id}") used as the `route` metric
+// label. It is carried separately from Path because deriving it by
+// pattern-matching the concrete URL is guesswork: IDs, branch patterns,
+// environment names and variable names are all path segments, and any
+// one of them leaking into a label multiplies the time series by the
+// number of distinct values. Callers that do not supply a Route are
+// bucketed under RouteOther rather than being labelled with raw path.
+type Call struct {
+	Prio   Priority
+	Owner  string
+	Method string
+	Path   string
+	Route  string
+	Body   any
+	Out    any
+}
+
+// RouteOther is the catch-all metric label for calls made without a
+// declared route template. Its presence in a dashboard means a call
+// site still needs a route.
+const RouteOther = "other"
+
+// Do runs a REST request described by Call. It predates the go-github
+// migration and remains for the paths the SDK does not cover — GraphQL
+// and Link-header pagination over endpoints go-github does not model.
+// Scheduling, auth and metrics all happen in the transport chain.
+func (c *Client) Do(ctx context.Context, call Call) (*http.Response, error) {
+	ctx = WithCall(ctx, call.Prio, call.Owner, call.Route)
+	return c.execute(ctx, call, PoolREST)
+}
+
+// DoREST is the positional form of Do, kept for call sites that have no
+// route template yet. Their traffic lands under RouteOther.
 func (c *Client) DoREST(ctx context.Context, prio Priority, owner, method, path string, body any, out any) (*http.Response, error) {
-	return Schedule(ctx, c.limiter, prio, PoolREST, func() (*http.Response, error) {
-		return c.execute(ctx, owner, method, path, body, out, PoolREST)
-	})
+	return c.Do(ctx, Call{Prio: prio, Owner: owner, Method: method, Path: path, Body: body, Out: out})
 }
 
 // DoGraphQL executes a GraphQL query under the GraphQL pool budget.
@@ -104,9 +190,12 @@ func (c *Client) DoGraphQL(ctx context.Context, prio Priority, owner, query stri
 			Message string `json:"message"`
 		} `json:"errors"`
 	}
-	_, err := Schedule(ctx, c.limiter, prio, PoolGraphQL, func() (*http.Response, error) {
+	gctx := WithGraphQLCall(ctx, prio, owner)
+	_, err := func() (*http.Response, error) {
 		var w wrapper
-		resp, err := c.execute(ctx, owner, http.MethodPost, "/graphql", body, &w, PoolGraphQL)
+		resp, err := c.execute(gctx, Call{
+			Owner: owner, Method: http.MethodPost, Path: "/graphql", Route: "/graphql", Body: body, Out: &w,
+		}, PoolGraphQL)
 		if err != nil {
 			return resp, err
 		}
@@ -123,14 +212,16 @@ func (c *Client) DoGraphQL(ctx context.Context, prio Priority, owner, query stri
 			}
 		}
 		return resp, nil
-	})
+	}()
 	return err
 }
 
 // execute is the inner request; it does NOT invoke the limiter (the caller
 // did via Schedule). It does update remaining budget from the response
 // headers and emit api_calls_total.
-func (c *Client) execute(ctx context.Context, owner, method, path string, body any, out any, pool Pool) (*http.Response, error) {
+func (c *Client) execute(ctx context.Context, call Call, pool Pool) (*http.Response, error) {
+	_ = pool // pool selection now travels in the call context
+	method, path, body, out := call.Method, call.Path, call.Body, call.Out
 	var bodyR io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -149,26 +240,11 @@ func (c *Client) execute(ctx context.Context, owner, method, path string, body a
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	if c.auth != nil && owner != "" {
-		instID, err := c.auth.InstallationID(ctx, owner)
-		if err != nil {
-			return nil, err
-		}
-		tok, err := c.auth.InstallationToken(ctx, instID)
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Authorization", "Bearer "+tok)
-	}
 
 	resp, err := c.core.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("github request: %w", err)
 	}
-	c.limiter.UpdateFromResponse(pool, resp.Header)
-	endpoint := scrubPath(path)
-	statusBucket := fmt.Sprintf("%d", resp.StatusCode/100*100)
-	metrics.APICallsTotal.WithLabelValues(method, endpoint, statusBucket).Inc()
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
@@ -199,29 +275,11 @@ func IsNotFound(err error) bool {
 	return errors.As(err, &ae) && ae.Status == http.StatusNotFound
 }
 
-// scrubPath replaces /<owner>/<repo>/ segments with placeholders so the
-// metric label cardinality is bounded.
-func scrubPath(path string) string {
-	u, err := url.Parse(path)
-	if err != nil {
-		return path
-	}
-	parts := strings.Split(u.Path, "/")
-	for i, p := range parts {
-		// /repos/{owner}/{repo}/...
-		if i > 0 && parts[i-1] == "repos" {
-			parts[i] = "{owner}"
-			if i+1 < len(parts) {
-				parts[i+1] = "{repo}"
-			}
-		}
-		if i > 0 && parts[i-1] == "orgs" {
-			parts[i] = "{org}"
-			break
-		}
-		_ = p
-	}
-	return strings.Join(parts, "/")
+// CheckRepository verifies access before loading optional admin files.
+func (c *Client) CheckRepository(ctx context.Context, repo config.Repo) error {
+	ctx = WithCall(ctx, PriorityCronReconcile, repo.Owner, ghapi.RouteRepo)
+	_, _, err := c.GH().Repositories.Get(ctx, repo.Owner, repo.Name)
+	return err
 }
 
 // GetFile implements config.FileFetcher: fetches a single file's content
@@ -231,12 +289,15 @@ func (c *Client) GetFile(ctx context.Context, repo config.Repo, path, ref string
 	if ref != "" {
 		q = "?ref=" + url.QueryEscape(ref)
 	}
-	url := fmt.Sprintf("/repos/%s/%s/contents/%s%s", repo.Owner, repo.Name, path, q)
+	_ = q
 	var v struct {
 		Encoding string `json:"encoding"`
 		Content  string `json:"content"`
 	}
-	_, err := c.DoREST(ctx, PriorityCronReconcile, repo.Owner, http.MethodGet, url, nil, &v)
+	_, err := c.Do(ctx, Call{
+		Prio: PriorityCronReconcile, Owner: repo.Owner, Method: http.MethodGet,
+		Path: ghapi.RepoContents(repo, path, ref), Route: ghapi.RouteRepoContents, Out: &v,
+	})
 	if err != nil {
 		if IsNotFound(err) {
 			return nil, config.ErrNotFound

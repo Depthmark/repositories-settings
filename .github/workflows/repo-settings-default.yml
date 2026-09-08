@@ -1,7 +1,7 @@
 ---
 # Opinionated wrapper around repo-settings.yml with org-baked defaults.
 # Consumer repos call THIS instead of the low-level workflow so they
-# don't each have to memorize api-url / sts-url / sts-app / etc.
+# don't each have to memorize the low-level workflow interface.
 #
 # Lives alongside repo-settings.yml in this repo at:
 #   .github/workflows/repo-settings-default.yml
@@ -14,16 +14,20 @@
 #     pull_request: { paths: ['.github/settings/**'] }
 #   permissions:
 #     contents: read
-#     checks: write
-#     id-token: write
 #     pull-requests: write    # for the dry-run sticky comment
+#     id-token: write         # authenticates this repo to the service
 #   jobs:
 #     settings:
-#       uses: Depthmark/repositories-settings/.github/workflows/repo-settings-default.yml@main
+#       uses: Depthmark/repositories-settings/.github/workflows/repo-settings-default.yml@<verified-full-commit-sha>
 #       with:
 #         api-url: https://repository-settings.example.com
-#         sts-url: https://github-sts.example.com
-#       secrets: inherit
+#
+# This wrapper defaults to OIDC: the workflow authenticates with the
+# short-lived identity token GitHub mints for it, which names this
+# repository, so the service will only reconcile this repository. There
+# is no shared secret to distribute or rotate. A trusted operator
+# workflow can pass auth-mode: token and secrets.api-token when OIDC is
+# unavailable. The service can accept both configured credential types.
 #
 # If a repo needs to override any of the baked defaults (e.g. staging
 # API URL), call repo-settings.yml directly instead.
@@ -37,13 +41,24 @@ on:
         description: "repo-settings service URL"
         required: true
         type: string
-      sts-url:
-        description: "STS service URL"
-        required: true
+      auth-mode:
+        description: |
+          "oidc" (default) authenticates with this workflow's GitHub
+          identity token and is scoped to this repository. "token" sends
+          the shared api-token secret and is not.
+        required: false
         type: string
+        default: "oidc"
+      oidc-audience:
+        description: "Must equal the service's OIDC_AUDIENCE."
+        required: false
+        type: string
+        default: "repo-settings"
     secrets:
-      api-secret:
-        description: "Optional fallback shared secret. Omit when using STS."
+      api-token:
+        description: |
+          Static token matching the repo-settings service API_TOKEN.
+          Required only when auth-mode is "token".
         required: false
 
 permissions: {}
@@ -52,17 +67,14 @@ jobs:
   settings:
     uses: ./.github/workflows/repo-settings.yml
     permissions:
-      contents: read
-      checks: write
-      id-token: write
-      pull-requests: write
+      contents: read        # Read .github/settings/*.yml for schema validation
+      pull-requests: write  # Post and update the dry-run sticky PR comment
+      id-token: write       # Mint this workflow's identity token (auth-mode: oidc)
     with:
       api-url: ${{ inputs.api-url }}
-      auth-method: sts
-      sts-url: ${{ inputs.sts-url }}
-      sts-app: depthmark-repo-settings
-      sts-identity: repo-settings
+      auth-mode: ${{ inputs.auth-mode }}
+      oidc-audience: ${{ inputs.oidc-audience }}
     secrets:
       # Explicit forwarding — narrower than `secrets: inherit` and
       # passes only what the called workflow actually declares.
-      api-secret: ${{ secrets.api-secret }}
+      api-token: ${{ secrets.api-token }}

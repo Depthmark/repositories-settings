@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"sync"
 
-	"gopkg.in/yaml.v3"
+	"github.com/Depthmark/repositories-settings/internal/yamlstrict"
 )
 
 // FileFetcher reads a single file from a repo (returns NotFound if absent).
@@ -24,6 +24,13 @@ var ErrNotFound = errors.New("file not found")
 // merged Settings. Files run in parallel; missing files are skipped; bad
 // YAML or schema errors are returned with the file name prefixed.
 func Load(ctx context.Context, f FileFetcher, repo Repo, ref string) (*Settings, error) {
+	return loadSettingsDir(ctx, f, repo, SettingsDirPrefix, ref)
+}
+
+// loadSettingsDir is Load against an arbitrary directory. The org admin
+// repository reuses it for the org layer and for each suborg tier, so
+// every layer parses through exactly the same validation.
+func loadSettingsDir(ctx context.Context, f FileFetcher, repo Repo, dir, ref string) (*Settings, error) {
 	type result struct {
 		name    string
 		content []byte
@@ -36,7 +43,7 @@ func Load(ctx context.Context, f FileFetcher, repo Repo, ref string) (*Settings,
 		wg.Add(1)
 		go func(name string) {
 			defer wg.Done()
-			b, err := f.GetFile(ctx, repo, SettingsDirPrefix+name, ref)
+			b, err := f.GetFile(ctx, repo, dir+name, ref)
 			results <- result{name: name, content: b, err: err}
 		}(name)
 	}
@@ -59,6 +66,7 @@ func Load(ctx context.Context, f FileFetcher, repo Repo, ref string) (*Settings,
 	if len(loadErrs) > 0 {
 		return nil, errors.Join(loadErrs...)
 	}
+	settings.Normalize()
 	return settings, nil
 }
 
@@ -74,162 +82,109 @@ func LoadFromMap(files map[string][]byte) (*Settings, error) {
 	if len(errs) > 0 {
 		return nil, errors.Join(errs...)
 	}
+	settings.Normalize()
 	return settings, nil
 }
 
-// mergeFile decodes one file's YAML into the right envelope, validates it,
-// and folds it into settings.
-func mergeFile(settings *Settings, name string, raw []byte) error {
-	switch name {
-	case "repo.yml":
-		var f RepoFile
-		if err := yaml.Unmarshal(raw, &f); err != nil {
-			return parseErr(name, err)
+// decodeFile is the shared body of every case in mergeFile: strict
+// YAML decode, schema validation, then fold the result into Settings.
+// Split out so each case reads as "which envelope, which validator,
+// where it lands" rather than eight lines of identical boilerplate.
+func decodeFile[F any](name string, raw []byte, validate func(*F) error, apply func(*F)) error {
+	var f F
+	if err := yamlstrict.Decode(raw, &f); err != nil {
+		if errors.Is(err, yamlstrict.ErrEmpty) {
+			// An empty file says the same thing as an absent one: this
+			// resource is unmanaged. Applying the zero-valued envelope
+			// instead would read as "manage this resource, with nothing
+			// in it" — i.e. delete everything GitHub currently has.
+			return nil
 		}
-		if err := ValidateRepoFile(&f); err != nil {
-			return err
-		}
-		if f.Repository != nil {
-			settings.Repo = f.Repository
-		}
-		if f.Topics != nil {
-			settings.Topics = f.Topics
-		}
-	case "teams.yml":
-		var f TeamsFile
-		if err := yaml.Unmarshal(raw, &f); err != nil {
-			return parseErr(name, err)
-		}
-		if err := ValidateTeamsFile(&f); err != nil {
-			return err
-		}
-		settings.Teams = &TeamsConfig{Teams: f.Teams}
-	case "rulesets.yml":
-		var f RulesetsFile
-		if err := yaml.Unmarshal(raw, &f); err != nil {
-			return parseErr(name, err)
-		}
-		if err := ValidateRulesetsFile(&f); err != nil {
-			return err
-		}
-		settings.Rulesets = &RulesetsConfig{Rulesets: f.Rulesets}
-	case "branches.yml":
-		var f BranchesFile
-		if err := yaml.Unmarshal(raw, &f); err != nil {
-			return parseErr(name, err)
-		}
-		if err := ValidateBranchesFile(&f); err != nil {
-			return err
-		}
-		settings.Branches = &BranchesConfig{Branches: f.Branches}
-	case "environments.yml":
-		var f EnvironmentsFile
-		if err := yaml.Unmarshal(raw, &f); err != nil {
-			return parseErr(name, err)
-		}
-		if err := ValidateEnvironmentsFile(&f); err != nil {
-			return err
-		}
-		settings.Environments = &EnvironmentsConfig{Environments: f.Environments}
-	case "webhooks.yml":
-		var f WebhooksFile
-		if err := yaml.Unmarshal(raw, &f); err != nil {
-			return parseErr(name, err)
-		}
-		if err := ValidateWebhooksFile(&f); err != nil {
-			return err
-		}
-		settings.Webhooks = &WebhooksConfig{Webhooks: f.Webhooks}
-	case "autolinks.yml":
-		var f AutolinksFile
-		if err := yaml.Unmarshal(raw, &f); err != nil {
-			return parseErr(name, err)
-		}
-		if err := ValidateAutolinksFile(&f); err != nil {
-			return err
-		}
-		settings.Autolinks = &AutolinksConfig{Autolinks: f.Autolinks}
-	case "actions.yml":
-		var f ActionsFile
-		if err := yaml.Unmarshal(raw, &f); err != nil {
-			return parseErr(name, err)
-		}
-		if err := ValidateActionsFile(&f); err != nil {
-			return err
-		}
-		ac := f.Actions
-		settings.Actions = &ac
-	case "security.yml":
-		var f SecurityFile
-		if err := yaml.Unmarshal(raw, &f); err != nil {
-			return parseErr(name, err)
-		}
-		if err := ValidateSecurityFile(&f); err != nil {
-			return err
-		}
-		sc := f.Security
-		settings.Security = &sc
-	case "pages.yml":
-		var f PagesFile
-		if err := yaml.Unmarshal(raw, &f); err != nil {
-			return parseErr(name, err)
-		}
-		if err := ValidatePagesFile(&f); err != nil {
-			return err
-		}
-		pc := f.Pages
-		settings.Pages = &pc
-	case "secrets.yml":
-		var f SecretsFile
-		if err := yaml.Unmarshal(raw, &f); err != nil {
-			return parseErr(name, err)
-		}
-		if err := ValidateSecretsFile(&f); err != nil {
-			return err
-		}
-		settings.Secrets = &SecretsConfig{RepositorySecrets: f.RepositorySecrets}
-	case "variables.yml":
-		var f VariablesFile
-		if err := yaml.Unmarshal(raw, &f); err != nil {
-			return parseErr(name, err)
-		}
-		if err := ValidateVariablesFile(&f); err != nil {
-			return err
-		}
-		settings.Variables = &VariablesConfig{Variables: f.Variables}
-	case "deploy-keys.yml":
-		var f DeployKeysFile
-		if err := yaml.Unmarshal(raw, &f); err != nil {
-			return parseErr(name, err)
-		}
-		if err := ValidateDeployKeysFile(&f); err != nil {
-			return err
-		}
-		settings.DeployKeys = &DeployKeysConfig{DeployKeys: f.DeployKeys}
-	case "custom-properties.yml":
-		var f CustomPropertiesFile
-		if err := yaml.Unmarshal(raw, &f); err != nil {
-			return parseErr(name, err)
-		}
-		if err := ValidateCustomPropertiesFile(&f); err != nil {
-			return err
-		}
-		settings.CustomProperties = &CustomPropertiesConfig{Properties: f.CustomProperties}
-	case "collaborators.yml":
-		var f CollaboratorsFile
-		if err := yaml.Unmarshal(raw, &f); err != nil {
-			return parseErr(name, err)
-		}
-		if err := ValidateCollaboratorsFile(&f); err != nil {
-			return err
-		}
-		settings.Collaborators = &CollaboratorsConfig{Collaborators: f.Collaborators}
-	default:
-		return fmt.Errorf("unknown settings file %q", name)
+		return &ValidationError{File: name, Issues: yamlstrict.Issues(err)}
 	}
+	if err := validate(&f); err != nil {
+		return err
+	}
+	apply(&f)
 	return nil
 }
 
-func parseErr(name string, err error) error {
-	return &ValidationError{File: name, Issues: []string{fmt.Sprintf("yaml: %v", err)}}
+// mergeFile decodes one file's YAML into the right envelope, validates
+// it, and folds it into settings.
+func mergeFile(settings *Settings, name string, raw []byte) error {
+	switch name {
+	case "repo.yml":
+		return decodeFile(name, raw, ValidateRepoFile, func(f *RepoFile) {
+			if f.Repository != nil {
+				settings.Repo = f.Repository
+			}
+			if f.Topics != nil {
+				settings.Topics = f.Topics
+			}
+		})
+	case "teams.yml":
+		return decodeFile(name, raw, ValidateTeamsFile, func(f *TeamsFile) {
+			settings.Teams = &TeamsConfig{Teams: f.Teams}
+		})
+	case "rulesets.yml":
+		return decodeFile(name, raw, ValidateRulesetsFile, func(f *RulesetsFile) {
+			settings.Rulesets = &RulesetsConfig{Rulesets: f.Rulesets}
+		})
+	case "branches.yml":
+		return decodeFile(name, raw, ValidateBranchesFile, func(f *BranchesFile) {
+			settings.Branches = &BranchesConfig{Branches: f.Branches}
+		})
+	case "environments.yml":
+		return decodeFile(name, raw, ValidateEnvironmentsFile, func(f *EnvironmentsFile) {
+			settings.Environments = &EnvironmentsConfig{Environments: f.Environments}
+		})
+	case "webhooks.yml":
+		return decodeFile(name, raw, ValidateWebhooksFile, func(f *WebhooksFile) {
+			settings.Webhooks = &WebhooksConfig{Webhooks: f.Webhooks}
+		})
+	case "autolinks.yml":
+		return decodeFile(name, raw, ValidateAutolinksFile, func(f *AutolinksFile) {
+			settings.Autolinks = &AutolinksConfig{Autolinks: f.Autolinks}
+		})
+	case "actions.yml":
+		return decodeFile(name, raw, ValidateActionsFile, func(f *ActionsFile) {
+			ac := f.Actions
+			settings.Actions = &ac
+		})
+	case "security.yml":
+		return decodeFile(name, raw, ValidateSecurityFile, func(f *SecurityFile) {
+			sc := f.Security
+			settings.Security = &sc
+		})
+	case "pages.yml":
+		return decodeFile(name, raw, ValidatePagesFile, func(f *PagesFile) {
+			pc := f.Pages
+			settings.Pages = &pc
+		})
+	case "secrets.yml":
+		return decodeFile(name, raw, ValidateSecretsFile, func(f *SecretsFile) {
+			settings.Secrets = &SecretsConfig{RepositorySecrets: f.RepositorySecrets}
+		})
+	case "variables.yml":
+		return decodeFile(name, raw, ValidateVariablesFile, func(f *VariablesFile) {
+			settings.Variables = &VariablesConfig{Variables: f.Variables}
+		})
+	case "deploy-keys.yml":
+		return decodeFile(name, raw, ValidateDeployKeysFile, func(f *DeployKeysFile) {
+			settings.DeployKeys = &DeployKeysConfig{DeployKeys: f.DeployKeys}
+		})
+	case "custom-properties.yml":
+		return decodeFile(name, raw, ValidateCustomPropertiesFile, func(f *CustomPropertiesFile) {
+			settings.CustomProperties = &CustomPropertiesConfig{Properties: f.CustomProperties}
+		})
+	case "collaborators.yml":
+		return decodeFile(name, raw, ValidateCollaboratorsFile, func(f *CollaboratorsFile) {
+			settings.Collaborators = &CollaboratorsConfig{Collaborators: f.Collaborators}
+		})
+	default:
+		return &ValidationError{
+			File:   name,
+			Issues: []string{fmt.Sprintf("unknown settings file %q — see .github/settings/ for the recognised names", name)},
+		}
+	}
 }

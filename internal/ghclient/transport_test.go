@@ -52,36 +52,82 @@ func TestConditionalGet_304ReturnsCachedBody(t *testing.T) {
 	}
 }
 
+// The cache is populated through a real GET so the entry carries the
+// production key shape (absolute URL) rather than a hand-written path.
+// The previous version of this test stored the key "/x" directly, which
+// happened to match the path the transport invalidated on and therefore
+// passed while production never invalidated anything.
 func TestConditionalGet_WriteInvalidates(t *testing.T) {
-	cache := newETagCache(0)
-	cache.Set("/x", etagEntry{etag: `"v1"`, body: []byte("old")})
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.Header().Set("ETag", `"v1"`)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"n":1}`))
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
+
+	cache := newETagCache(0)
 	c := &http.Client{Transport: newConditionalGetTransport(http.DefaultTransport, cache)}
 
-	req, _ := http.NewRequest(http.MethodPatch, srv.URL+"/x", nil)
-	resp, err := c.Do(req)
+	readURL := srv.URL + "/repos/o/r/rulesets"
+	resp, err := c.Get(readURL)
 	if err != nil {
 		t.Fatal(err)
 	}
+	_, _ = io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
+	if _, ok := cache.Get(readURL); !ok {
+		t.Fatalf("GET did not populate the cache under key %q", readURL)
+	}
 
-	// Cache key was the absolute URL on Set; PATCH invalidates by URL.Path.
-	// The stored key happens to be "/x" — the transport uses req.URL.Path
-	// for invalidation prefix matching, which matches.
-	if _, ok := cache.Get("/x"); ok {
-		t.Fatal("expected cache to be invalidated after write")
+	// Writing one item of the collection must drop the cached collection.
+	req, _ := http.NewRequest(http.MethodPut, srv.URL+"/repos/o/r/rulesets/7", nil)
+	wresp, err := c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = wresp.Body.Close()
+
+	if _, ok := cache.Get(readURL); ok {
+		t.Fatal("writing an item left the collection read cached")
 	}
 }
 
-func TestParseNextLink(t *testing.T) {
-	header := `<https://api.github.com/x?page=2>; rel="next", <https://api.github.com/x?page=10>; rel="last"`
-	if got := parseNextLink(header); got != "https://api.github.com/x?page=2" {
-		t.Fatalf("got %q", got)
+// A failed write leaves live state untouched, so the cached read is
+// still accurate and must not be thrown away.
+func TestConditionalGet_FailedWriteKeepsCache(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.Header().Set("ETag", `"v1"`)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"n":1}`))
+			return
+		}
+		w.WriteHeader(http.StatusUnprocessableEntity)
+	}))
+	defer srv.Close()
+
+	cache := newETagCache(0)
+	c := &http.Client{Transport: newConditionalGetTransport(http.DefaultTransport, cache)}
+	readURL := srv.URL + "/repos/o/r/rulesets"
+	resp, err := c.Get(readURL)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := parseNextLink(""); got != "" {
-		t.Fatalf("expected empty, got %q", got)
+	_, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+
+	req, _ := http.NewRequest(http.MethodPut, srv.URL+"/repos/o/r/rulesets/7", nil)
+	wresp, err := c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = wresp.Body.Close()
+
+	if _, ok := cache.Get(readURL); !ok {
+		t.Fatal("a rejected write must not invalidate the cache")
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/Depthmark/repositories-settings/internal/applier"
+	"github.com/Depthmark/repositories-settings/internal/config"
 	"github.com/Depthmark/repositories-settings/internal/diff"
 )
 
@@ -17,9 +18,10 @@ import (
 //  2. ⚠️ Disabled by operator policy — TOP, open by default, so a
 //     user whose secrets/pages YAML is being silently ignored sees
 //     the warning before they scroll into the diff
-//  3. Errors / Not allowed — open by default (action required)
-//  4. What's changing — the per-resource diff
-//  5. Apply hint — one-liner pointing at the bot's PR commands
+//  3. Org policy violations — what the org refused, and why
+//  4. Errors / Not allowed — open by default (action required)
+//  5. What's changing — the per-resource diff
+//  6. Apply hint — one-liner pointing at the bot's PR commands
 //
 // Every section is wrapped in <details> so a reviewer can collapse
 // any of them; the warning and error sections default to open since
@@ -55,25 +57,38 @@ func FormatReportMarkdown(rep *Report) string {
 		b.WriteString("\n</details>\n\n")
 	}
 
-	// 3. Errors — open by default, these block the apply and require action.
-	if len(blocked) > 0 {
+	// 3. Org policy. A refused run never reached a lane, so its
+	// violations are the only thing to report — and even on a run that
+	// went ahead, warnings belong here where the reader can see the
+	// policy tightening coming.
+	if len(rep.Violations) > 0 {
+		writeViolations(&b, rep)
+	}
+
+	// 4. Errors — open by default, these block the apply and require
+	// action. A policy refusal already rendered its own section above,
+	// and the synthetic Results behind it would only repeat it.
+	if len(blocked) > 0 && !rep.Blocked {
 		fmt.Fprintf(&b, "<details open>\n<summary>:no_entry: %d error(s) — these block the apply</summary>\n\n", len(blocked))
 		b.WriteString("Resolve the underlying issue before merging. Common causes: missing GitHub App permission, locked branch protection, or a value rejected by the GitHub API.\n\n")
 		writeBlockedTable(&b, blocked)
 		b.WriteString("\n</details>\n\n")
 	}
 
-	// 4. The diff — the actual changes the reviewer is approving.
+	// 5. The diff — the actual changes the reviewer is approving.
 	// Wrapped in <details open> so it can be collapsed for runs where
-	// the user only cares about the verdict + warnings above.
-	b.WriteString("<details open>\n<summary>What's changing</summary>\n\n")
-	b.WriteString(diff.FormatMarkdown(rep.Diffs))
-	b.WriteString("\n</details>\n\n")
+	// the user only cares about the verdict + warnings above. A refused
+	// run computed no diff, so there is nothing to show.
+	if !rep.Blocked {
+		b.WriteString("<details open>\n<summary>What's changing</summary>\n\n")
+		b.WriteString(diff.FormatMarkdown(rep.Diffs))
+		b.WriteString("\n</details>\n\n")
+	}
 
-	// 5. Apply hint — only meaningful when there's something to apply
+	// 6. Apply hint — only meaningful when there's something to apply
 	// and nothing's blocking. Errors take priority; in that state the
 	// hint would be misleading ("apply now" → would re-fail).
-	if rep.DryRun && totalChanges > 0 && len(blocked) == 0 {
+	if rep.DryRun && totalChanges > 0 && len(blocked) == 0 && !rep.Blocked {
 		b.WriteString("> Comment `apply` to apply now, `recheck` to refresh.\n")
 	}
 
@@ -87,6 +102,11 @@ func FormatReportMarkdown(rep *Report) string {
 // scrolling.
 func writeVerdict(b *strings.Builder, rep *Report, blocked, skipped []blockedEntry, totalChanges, createN, updateN, deleteN int) {
 	switch {
+	case rep.Blocked:
+		fmt.Fprintf(b, "## :no_entry: repo-settings — refused by org policy (%d violation(s))\n\n",
+			countSeverity(rep.Violations, config.SevError))
+		b.WriteString("Nothing was read or written. The organization's admin policy does not permit this configuration.\n\n")
+		return
 	case len(blocked) > 0:
 		fmt.Fprintf(b, "## :rotating_light: repo-settings — blocked (%d error(s))\n\n", len(blocked))
 	case totalChanges == 0 && rep.DryRun:
@@ -111,6 +131,57 @@ func writeVerdict(b *strings.Builder, rep *Report, blocked, skipped []blockedEnt
 	} else if len(skipped) > 0 {
 		fmt.Fprintf(b, "**%d skipped by operator policy**\n\n", len(skipped))
 	}
+}
+
+// writeViolations renders the org policy verdict. Errors and warnings
+// are separated because they mean different things to the reader: an
+// error is why nothing happened, a warning is a heads-up that the org
+// intends to refuse this later.
+func writeViolations(b *strings.Builder, rep *Report) {
+	errs := filterSeverity(rep.Violations, config.SevError)
+	warns := filterSeverity(rep.Violations, config.SevWarning)
+
+	if len(errs) > 0 {
+		fmt.Fprintf(b, "<details open>\n<summary>:no_entry_sign: %d org policy violation(s)</summary>\n\n", len(errs))
+		b.WriteString("These are set by the organization's admin repository, not by this repository. Remove the override, or ask an org admin to change the policy.\n\n")
+		writeViolationTable(b, errs)
+		b.WriteString("\n</details>\n\n")
+	}
+	if len(warns) > 0 {
+		fmt.Fprintf(b, "<details>\n<summary>:warning: %d org policy warning(s)</summary>\n\n", len(warns))
+		b.WriteString("These do not block the apply today.\n\n")
+		writeViolationTable(b, warns)
+		b.WriteString("\n</details>\n\n")
+	}
+}
+
+func writeViolationTable(b *strings.Builder, vs []config.PolicyViolation) {
+	b.WriteString("| Field | Policy | Reason |\n")
+	b.WriteString("|-------|--------|--------|\n")
+	sorted := append([]config.PolicyViolation(nil), vs...)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].Field != sorted[j].Field {
+			return sorted[i].Field < sorted[j].Field
+		}
+		return sorted[i].Message < sorted[j].Message
+	})
+	for _, v := range sorted {
+		fmt.Fprintf(b, "| `%s` | `%s` | %s |\n", v.Field, v.OrgPolicy, escapePipe(firstLine(v.Message)))
+	}
+}
+
+func filterSeverity(vs []config.PolicyViolation, want config.PolicySeverity) []config.PolicyViolation {
+	out := make([]config.PolicyViolation, 0, len(vs))
+	for _, v := range vs {
+		if v.Severity == want {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+func countSeverity(vs []config.PolicyViolation, want config.PolicySeverity) int {
+	return len(filterSeverity(vs, want))
 }
 
 func countDiffs(diffs []diff.Diff) (creates, updates, deletes, noops int) {
