@@ -1,8 +1,8 @@
 issuer: https://token.actions.githubusercontent.com
-subject: "repo:Depthmark/template-go:ref:refs/heads/main"
+subject: "repo:Depthmark/repositories-settings:ref:refs/heads/main"
 
 claim_pattern:
-  workflow_ref: "Depthmark/template-go/.github/workflows/release-please.yml@refs/heads/main"
+  workflow_ref: "Depthmark/repositories-settings/.github/workflows/release-please.yml@refs/heads/main"
 
 permissions:
   contents: write
