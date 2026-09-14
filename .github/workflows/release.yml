@@ -36,6 +36,6 @@ jobs:
       attest: false
     permissions:
       contents: read
-      packages: write
-      id-token: write
-      attestations: write
+      packages: write       # Push the container image to the registry
+      id-token: write       # Keyless signing identity for the published image
+      attestations: write   # Record the build provenance attestation
