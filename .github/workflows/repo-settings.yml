@@ -1,9 +1,8 @@
 ---
-# Low-level reusable workflow for repo-settings.
+# Reusable workflow for repo-settings. This is the only supported entry
+# point for consumer repositories.
 #
-# Most consumers should use repo-settings-default.yml (same directory),
-# which wraps this one with org-baked defaults. Call THIS workflow
-# directly only when you need to override something the wrapper hardcodes.
+# Consumer usage (.github/workflows/repo-settings.yml in any target repo):
 #
 #   name: repo-settings
 #   on:
@@ -11,16 +10,37 @@
 #       branches: [main]
 #       paths: ['.github/settings/**']
 #     pull_request:
-#       paths: ['.github/settings/**']
-#   permissions:
-#     contents: read
-#     pull-requests: write    # for the dry-run sticky comment
-#     id-token: write         # see "Authentication" below
+#       # Listing this file makes a pin-bump PR dry-run the new workflow
+#       # version against this repository's settings before merge.
+#       paths: ['.github/settings/**', '.github/workflows/repo-settings.yml']
+#   permissions: {}
 #   jobs:
 #     settings:
-#       uses: Depthmark/repositories-settings/.github/workflows/repo-settings.yml@<verified-full-commit-sha>
-#       with:
-#         auth-mode: oidc
+#       uses: Depthmark/repositories-settings/.github/workflows/repo-settings.yml@<full-commit-sha> # repo-settings-workflows-vX.Y.Z
+#       permissions:
+#         contents: read        # read .github/settings/*.yml
+#         pull-requests: write  # dry-run sticky comment
+#         id-token: write       # see "Authentication" below
+#
+# Service URL
+# -----------
+# The service URL is deployment configuration, not workflow code, so it
+# comes from the REPO_SETTINGS_URL organization variable. A called
+# workflow reads the caller repository's variables, which include the
+# organization's, so moving the service needs no workflow release. Pass
+# api-url only to target another deployment, such as staging.
+#
+# Versioning
+# ----------
+# This file is released on its own cycle (release-please component
+# repo-settings-workflows, tags repo-settings-workflows-vX.Y.Z),
+# independent of the service image. Consumers pin a commit SHA and take
+# bumps through Dependabot. The HTTP API is the contract between the two:
+# the service must accept every workflow version still in use, so API
+# changes are additive and a breaking change needs a new endpoint
+# version and a major workflow release. Each request sends
+# User-Agent: repo-settings-workflow/<version>, which the service access
+# log records, to show which versions are still calling.
 #
 # Authentication
 # --------------
@@ -46,10 +66,12 @@ on:
   workflow_call:
     inputs:
       api-url:
-        description: "repo-settings service URL"
+        description: |
+          repo-settings service URL. Leave empty to use the
+          REPO_SETTINGS_URL organization or repository variable.
         required: false
         type: string
-        default: "https://repo-settings.internal"
+        default: ""
       auth-mode:
         description: |
           How to authenticate to the service: "oidc" (this workflow's
@@ -89,7 +111,19 @@ jobs:
       contents: read        # Read .github/settings/*.yml for schema validation
       pull-requests: write  # Post and update the dry-run sticky PR comment
       id-token: write       # Mint this workflow's identity token (auth-mode: oidc)
+    env:
+      API_URL: ${{ inputs.api-url || vars.REPO_SETTINGS_URL }}
+      # Updated by release-please on each repo-settings-workflows release.
+      WORKFLOW_VERSION: "0.0.0" # x-release-please-version
     steps:
+      - name: Check service URL
+        run: |
+          if [ -z "$API_URL" ]; then
+            echo "::error::No service URL. Set the REPO_SETTINGS_URL organization variable, or pass api-url."
+            exit 1
+          fi
+          echo "Service: ${API_URL} (repo-settings-workflow/${WORKFLOW_VERSION})"
+
       # --- Pre-flight: validate YAML schemas ---
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -97,8 +131,6 @@ jobs:
           persist-credentials: false
 
       - name: Validate settings schemas
-        env:
-          API_URL: ${{ inputs.api-url }}
         run: |
           # Collect all .github/settings/*.yml files into a JSON array.
           FILES="[]"
@@ -119,6 +151,7 @@ jobs:
           HTTP_CODE=$(curl -s -o /tmp/validate-response.json \
             -w '%{http_code}' \
             -X POST "${API_URL}/api/validate" \
+            -A "repo-settings-workflow/${WORKFLOW_VERSION}" \
             -H "Content-Type: application/json" \
             -d "{\"files\": ${FILES}}")
           RESPONSE=$(cat /tmp/validate-response.json)
@@ -202,7 +235,6 @@ jobs:
         id: check
         if: github.event_name == 'pull_request'
         env:
-          API_URL: ${{ inputs.api-url }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO_OWNER: ${{ github.repository_owner }}
@@ -210,6 +242,7 @@ jobs:
         run: |
           # Build curl args as an array so word-splitting / quoting are clean.
           HEADERS=(
+            -A "repo-settings-workflow/${WORKFLOW_VERSION}"
             -H "Content-Type: application/json"
             -H "Authorization: Bearer ${REPO_SETTINGS_BEARER}"
           )
@@ -350,12 +383,12 @@ jobs:
           github.event_name == 'push' && github.event.deleted == false &&
           github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         env:
-          API_URL: ${{ inputs.api-url }}
           REPO_OWNER: ${{ github.repository_owner }}
           REPO_NAME: ${{ github.event.repository.name }}
           CHANGED_FILES: ${{ steps.changed.outputs.files }}
         run: |
           HEADERS=(
+            -A "repo-settings-workflow/${WORKFLOW_VERSION}"
             -H "Content-Type: application/json"
             -H "Authorization: Bearer ${REPO_SETTINGS_BEARER}"
           )
