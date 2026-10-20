@@ -37,7 +37,7 @@ FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c
 LABEL maintainer="Alexandre Delisle <oss@adelisle.com>"
 LABEL description="repo-settings — declarative GitHub repository configuration-as-code"
 # x-release-please-start-version
-LABEL version="0.0.0"
+LABEL version="1.0.0"
 # x-release-please-end
 
 COPY --from=builder /repo-settings /repo-settings
