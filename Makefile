@@ -3,7 +3,7 @@
 # ─── Build ───────────────────────────────────────────────────────────────────
 
 build:
-	CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/template-go ./cmd/template-go
+	CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/repo-settings ./cmd/repo-settings
 
 # ─── Test ────────────────────────────────────────────────────────────────────
 
@@ -41,10 +41,10 @@ vuln-check:
 # ─── Docker ──────────────────────────────────────────────────────────────────
 
 docker:
-	docker build -t template-go:local .
+	docker build -t repo-settings:local .
 
 docker-load:
-	docker build -t template-go:local --load .
+	docker build -t repo-settings:local --load .
 
 # ─── CI (local) ──────────────────────────────────────────────────────────────
 
