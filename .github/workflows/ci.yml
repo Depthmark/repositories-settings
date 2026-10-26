@@ -28,7 +28,7 @@ permissions: {}
 
 jobs:
   ci-go:
-    uses: Depthmark/reusable-workflows/.github/workflows/ci-go.yml@b75184a59af82875f02abd547e57645ffcdcd91a # v1.0.1
+    uses: Depthmark/reusable-workflows/.github/workflows/ci-go.yml@55c7a3dbce97a8ba6ea8ed45fc26463b1b8a1f77 # v1.2.0
     with:
       docker-build: true
     permissions:

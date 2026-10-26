@@ -29,7 +29,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────
   docker:
     needs: [ci]
-    uses: Depthmark/reusable-workflows/.github/workflows/docker-build-push.yml@b75184a59af82875f02abd547e57645ffcdcd91a # v1.0.1
+    uses: Depthmark/reusable-workflows/.github/workflows/docker-build-push.yml@55c7a3dbce97a8ba6ea8ed45fc26463b1b8a1f77 # v1.2.0
     with:
       tag_name: ${{ inputs.tag_name || github.ref_name }}
       sign: true
