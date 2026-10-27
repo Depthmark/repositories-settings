@@ -569,7 +569,14 @@ TypeScript parity harness.
   per-call boilerplate.
 - **Strict config parsing.** `.github/settings/*.yml` is decoded with
   `KnownFields(true)`, so a misspelled key is an error naming the field
-  and its line rather than a setting that silently does nothing.
+  and its line rather than a setting that silently does nothing. A
+  boolean setting accepts only `true` or `false` (`True` and `TRUE`
+  too): `lock_branch: yes`, `on`, `"true"` or `1` is an error naming
+  the field and its line, such as `branches.yml: line 4:
+  branches[0].lock_branch: must be true or false`, rather than a value
+  you did not write. A null leaves the setting unset, as for any key.
+  Free-form values, ruleset `parameters` and `custom_properties`, keep
+  what you wrote: `yes` there stays the string `"yes"`.
 - **Org/suborg layering and admin policy are enforced**, not merely
   present. Set `ORG_ADMIN_REPO` to turn them on; see
   [Org layering and policy](#org-layering-and-policy). With it unset, a

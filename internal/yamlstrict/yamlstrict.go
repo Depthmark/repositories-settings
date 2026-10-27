@@ -8,14 +8,21 @@
 // change that does nothing. KnownFields(true) turns that into an error
 // naming the offending field.
 //
+// Booleans get the same treatment: yaml.v3 decodes `yes`, `on` and
+// their opposites into a Go bool, so `lock_branch: yes` would load as
+// true. Decode refuses any bool field whose value is not true or false,
+// and names the field.
+//
 // Modelled on the package of the same name in github-sts.
 package yamlstrict
 
 import (
 	"bytes"
+	"cmp"
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -28,14 +35,15 @@ import (
 var ErrEmpty = errors.New("empty YAML document")
 
 // Decode decodes exactly one YAML document into destination and rejects
-// any field not represented by a yaml tag on it. yaml.v3 additionally
-// rejects duplicate mapping keys while decoding.
+// any field not represented by a yaml tag on it, and any bool field
+// whose value is not a YAML boolean. yaml.v3 additionally rejects
+// duplicate mapping keys while decoding.
 //
 // Returns ErrEmpty when the document holds nothing.
 func Decode(data []byte, destination any) error {
+	var doc yaml.Node
 	dec := yaml.NewDecoder(bytes.NewReader(data))
-	dec.KnownFields(true)
-	if err := dec.Decode(destination); err != nil {
+	if err := dec.Decode(&doc); err != nil {
 		if errors.Is(err, io.EOF) {
 			return ErrEmpty
 		}
@@ -50,7 +58,38 @@ func Decode(data []byte, destination any) error {
 	if !errors.Is(err, io.EOF) {
 		return err
 	}
-	return nil
+
+	// The walk runs on the parsed node, before yaml.v3 turns `yes`
+	// into true. The decode still runs after it, so a file with both
+	// a wrong boolean and a typo reports both.
+	bools := checkBools(&doc, destination)
+	strict := yaml.NewDecoder(bytes.NewReader(data))
+	strict.KnownFields(true)
+	return withBoolIssues(strict.Decode(destination), bools)
+}
+
+// withBoolIssues joins the walk's issues to what the decode reported, in
+// line order, as one TypeError so that Issues splits them.
+func withBoolIssues(err error, bools *boolWalk) error {
+	if len(bools.issues) == 0 {
+		return err
+	}
+	out := bools.issues
+	var te *yaml.TypeError
+	switch {
+	case errors.As(err, &te):
+		for _, msg := range te.Errors {
+			if !bools.covers(msg) {
+				out = append(out, msg)
+			}
+		}
+	case err != nil:
+		// The decode stopped, for example on an explicit `!!bool yes`;
+		// the fields the walk named are still worth reporting.
+		out = append(out, err.Error())
+	}
+	slices.SortStableFunc(out, func(a, b string) int { return cmp.Compare(lineOf(a), lineOf(b)) })
+	return &yaml.TypeError{Errors: out}
 }
 
 // Issues splits a decode error into one message per problem.
