@@ -233,7 +233,7 @@ func repoFieldSet(r *RepoConfig) map[string]struct{} {
 	rt := rv.Type()
 	for i := 0; i < rv.NumField(); i++ {
 		f := rv.Field(i)
-		if f.Kind() == reflect.Ptr && !f.IsNil() {
+		if f.Kind() == reflect.Pointer && !f.IsNil() {
 			tag := rt.Field(i).Tag.Get("yaml")
 			if tag == "" {
 				continue
@@ -260,7 +260,7 @@ func boolFieldsFalse(s *SecurityConfig) map[string]struct{} {
 	rt := rv.Type()
 	for i := 0; i < rv.NumField(); i++ {
 		f := rv.Field(i)
-		if f.Kind() == reflect.Ptr && !f.IsNil() && f.Elem().Kind() == reflect.Bool && !f.Elem().Bool() {
+		if f.Kind() == reflect.Pointer && !f.IsNil() && f.Elem().Kind() == reflect.Bool && !f.Elem().Bool() {
 			tag := rt.Field(i).Tag.Get("yaml")
 			name := strings.Split(tag, ",")[0]
 			out[name] = struct{}{}
