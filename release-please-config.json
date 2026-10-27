@@ -4,6 +4,7 @@
   "packages": {
     ".": {
       "release-type": "go",
+      "release-as": "0.0.1",
       "package-name": "repositories-settings",
       "component": "repositories-settings",
       "include-component-in-tag": false,
