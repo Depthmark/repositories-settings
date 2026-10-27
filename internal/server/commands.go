@@ -3,6 +3,8 @@ package server
 import (
 	"regexp"
 	"strings"
+
+	"github.com/Depthmark/repositories-settings/internal/ghclient"
 )
 
 // Command is one of the verbs the bot understands when mentioned in a
@@ -16,14 +18,6 @@ const (
 	CmdApply   Command = "apply"   // apply the configuration now (privileged)
 	CmdHelp    Command = "help"    // post the command list
 )
-
-// privilegedCommands require write access. Comparisons are against the
-// payload's `author_association`. GitHub guarantees these strings.
-var privilegedAssociations = map[string]bool{
-	"OWNER":        true,
-	"MEMBER":       true,
-	"COLLABORATOR": true,
-}
 
 // ParsedCommand is the result of scanning a comment body. Slug is the
 // lowercase mention that triggered the parse (without the leading @);
@@ -108,10 +102,12 @@ func normalizeVerb(s string) Command {
 	return CmdNone
 }
 
-// IsPrivilegedAuthor returns true when the author_association string
-// from a webhook payload represents a user with write access.
-func IsPrivilegedAuthor(association string) bool {
-	return privilegedAssociations[strings.ToUpper(association)]
+// CanApply reports whether a repository permission allows apply. It
+// reads GitHub's base role, where maintain maps to write and triage to
+// read, so a custom role built on write passes and one built on read
+// does not.
+func CanApply(p ghclient.RepoPermission) bool {
+	return p.Permission == "admin" || p.Permission == "write"
 }
 
 // HelpMarkdown is what the bot replies when asked for help or when an
@@ -121,7 +117,7 @@ func HelpMarkdown(slug string) string {
 		slug = "repo-settings"
 	}
 	return "**" + slug + "** commands:\n\n" +
-		"- `@" + slug + " recheck` (alias `diff`) — re-run the dry-run and refresh the diff comment.\n" +
-		"- `@" + slug + " apply` — apply the configuration now. Requires write access.\n" +
+		"- `@" + slug + " recheck` (alias `diff`) — dry-run this pull request's head and refresh the diff comment.\n" +
+		"- `@" + slug + " apply` — apply the default branch's configuration now. Requires write, maintain or admin permission.\n" +
 		"- `@" + slug + " help` — show this message.\n"
 }

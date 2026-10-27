@@ -1,6 +1,10 @@
 package server
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/Depthmark/repositories-settings/internal/ghclient"
+)
 
 func TestParseComment_Variants(t *testing.T) {
 	cases := []struct {
@@ -33,24 +37,30 @@ func TestParseComment_Variants(t *testing.T) {
 	}
 }
 
-func TestIsPrivilegedAuthor(t *testing.T) {
+// GitHub maps maintain to write and triage to read in `permission`, so
+// the decision reads that field and role_name only names the role.
+func TestCanApply(t *testing.T) {
 	cases := []struct {
-		assoc string
-		want  bool
+		name string
+		perm ghclient.RepoPermission
+		want bool
 	}{
-		{"OWNER", true},
-		{"MEMBER", true},
-		{"COLLABORATOR", true},
-		{"owner", true}, // case-insensitive
-		{"CONTRIBUTOR", false},
-		{"FIRST_TIME_CONTRIBUTOR", false},
-		{"NONE", false},
-		{"", false},
+		{"admin", ghclient.RepoPermission{Permission: "admin", RoleName: "admin"}, true},
+		{"maintain", ghclient.RepoPermission{Permission: "write", RoleName: "maintain"}, true},
+		{"write", ghclient.RepoPermission{Permission: "write", RoleName: "write"}, true},
+		{"custom role built on write", ghclient.RepoPermission{Permission: "write", RoleName: "release-manager"}, true},
+		{"triage", ghclient.RepoPermission{Permission: "read", RoleName: "triage"}, false},
+		{"read", ghclient.RepoPermission{Permission: "read", RoleName: "read"}, false},
+		{"none", ghclient.RepoPermission{Permission: "none"}, false},
+		{"role name alone grants nothing", ghclient.RepoPermission{RoleName: "admin"}, false},
+		{"empty", ghclient.RepoPermission{}, false},
 	}
 	for _, tc := range cases {
-		if got := IsPrivilegedAuthor(tc.assoc); got != tc.want {
-			t.Errorf("IsPrivilegedAuthor(%q) = %v, want %v", tc.assoc, got, tc.want)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			if got := CanApply(tc.perm); got != tc.want {
+				t.Errorf("CanApply(%+v) = %v, want %v", tc.perm, got, tc.want)
+			}
+		})
 	}
 }
 

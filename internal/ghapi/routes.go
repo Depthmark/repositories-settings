@@ -68,14 +68,17 @@ const (
 
 	RoutePropertyValues = "/repos/{owner}/{repo}/properties/values"
 
-	RouteCollaborators     = "/repos/{owner}/{repo}/collaborators"
-	RouteCollaboratorsUser = "/repos/{owner}/{repo}/collaborators/{username}"
+	RouteCollaborators          = "/repos/{owner}/{repo}/collaborators"
+	RouteCollaboratorsUser      = "/repos/{owner}/{repo}/collaborators/{username}"
+	RouteCollaboratorPermission = "/repos/{owner}/{repo}/collaborators/{username}/permission"
 
 	RouteBranchProtection = "/repos/{owner}/{repo}/branches/{branch}/protection"
 	RouteBranchSignatures = "/repos/{owner}/{repo}/branches/{branch}/protection/required_signatures"
 
 	RouteIssueComments   = "/repos/{owner}/{repo}/issues/{issue_number}/comments"
 	RouteIssueCommentsID = "/repos/{owner}/{repo}/issues/comments/{comment_id}"
+
+	RoutePullRequest = "/repos/{owner}/{repo}/pulls/{pull_number}"
 
 	RouteGraphQL = "/graphql"
 )
@@ -97,9 +100,10 @@ var AllRoutes = []string{
 	RouteVariables, RouteVariablesName,
 	RouteKeys, RouteKeysID,
 	RoutePropertyValues,
-	RouteCollaborators, RouteCollaboratorsUser,
+	RouteCollaborators, RouteCollaboratorsUser, RouteCollaboratorPermission,
 	RouteBranchProtection, RouteBranchSignatures,
 	RouteIssueComments, RouteIssueCommentsID,
+	RoutePullRequest,
 	RouteGraphQL,
 }
 
