@@ -15,27 +15,8 @@
       "extra-files": [
         "Dockerfile"
       ],
-      "include-paths": [
-        "*.go",
-        "cmd",
-        "internal",
-        "go.mod",
-        "go.sum"
-      ]
-    },
-    ".github/workflows": {
-      "release-type": "simple",
-      "package-name": "repo-settings-workflows",
-      "component": "repo-settings-workflows",
-      "include-component-in-tag": true,
-      "changelog-type": "default",
-      "bump-minor-pre-major": true,
-      "bump-patch-for-minor-pre-major": true,
-      "draft": false,
-      "prerelease": false,
-      "include-paths": [
-        ".github/workflows/repo-settings.yml",
-        ".github/workflows/repo-settings-default.yml"
+      "exclude-paths": [
+        ".github"
       ]
     }
   }
