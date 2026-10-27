@@ -22,6 +22,9 @@ const liveProtection = `{
   "allow_force_pushes": {"enabled": false},
   "allow_deletions": {"enabled": false},
   "required_conversation_resolution": {"enabled": true},
+  "block_creations": {"enabled": true},
+  "lock_branch": {"enabled": true},
+  "allow_fork_syncing": {"enabled": false},
   "required_signatures": {"url":"u","enabled": false}
 }`
 
@@ -41,6 +44,9 @@ func TestDecodeProtection_ProjectsOntoWriteShape(t *testing.T) {
 		"allow_force_pushes":               false,
 		"allow_deletions":                  false,
 		"required_conversation_resolution": true,
+		"block_creations":                  true,
+		"lock_branch":                      true,
+		"allow_fork_syncing":               false,
 		"required_signatures":              false,
 		"required_status_checks": map[string]any{
 			"strict":   true,
@@ -113,5 +119,45 @@ func TestEncodeProtection_NeverSendsNullLists(t *testing.T) {
 	}
 	if req.Restrictions.Users == nil || req.Restrictions.Teams == nil || req.Restrictions.Apps == nil {
 		t.Errorf("restriction lists must be empty lists, not null: %#v", req.Restrictions)
+	}
+}
+
+// GitHub switches off any of these three that the PUT body leaves out,
+// so the body states each one: the configured value, or the explicit
+// false Normalize filled in.
+func TestEncodeProtection_SendsLockAndCreationFields(t *testing.T) {
+	s := &config.Settings{Branches: &config.BranchesConfig{Branches: []config.BranchProtection{
+		{Pattern: "main", LockBranch: config.Ptr(true), BlockCreations: config.Ptr(true)},
+	}}}
+	s.Normalize()
+	raw, err := json.Marshal(EncodeProtection(s.Branches.Branches[0]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]any{"lock_branch": true, "block_creations": true, "allow_fork_syncing": false}
+	for k, v := range want {
+		if got, ok := body[k]; !ok || got != v {
+			t.Errorf("%s = %v (present: %v), want %v in %s", k, got, ok, v, raw)
+		}
+	}
+}
+
+// A sub-object GitHub omits decodes to an explicit null, the same value
+// the desired document holds for one the config leaves out, so the two
+// compare equal instead of reporting nil -> nil.
+func TestDecodeProtection_AbsentSubObjectsAreNull(t *testing.T) {
+	var p github.Protection
+	if err := json.Unmarshal([]byte(`{"enforce_admins":{"enabled":false}}`), &p); err != nil {
+		t.Fatal(err)
+	}
+	got := DecodeProtection(&p)
+	for _, k := range []string{"required_status_checks", "required_pull_request_reviews", "restrictions"} {
+		if v, ok := got[k]; !ok || v != nil {
+			t.Errorf("%s = %v (present: %v), want an explicit nil", k, v, ok)
+		}
 	}
 }

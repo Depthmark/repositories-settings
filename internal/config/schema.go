@@ -189,6 +189,9 @@ type BranchProtection struct {
 	AllowForcePushes               *bool                 `yaml:"allow_force_pushes,omitempty" json:"allow_force_pushes,omitempty"`
 	AllowDeletions                 *bool                 `yaml:"allow_deletions,omitempty" json:"allow_deletions,omitempty"`
 	RequiredConversationResolution *bool                 `yaml:"required_conversation_resolution,omitempty" json:"required_conversation_resolution,omitempty"`
+	BlockCreations                 *bool                 `yaml:"block_creations,omitempty" json:"block_creations,omitempty"`
+	LockBranch                     *bool                 `yaml:"lock_branch,omitempty" json:"lock_branch,omitempty"`
+	AllowForkSyncing               *bool                 `yaml:"allow_fork_syncing,omitempty" json:"allow_fork_syncing,omitempty"`
 
 	// RequiredSignatures is a separate GitHub sub-resource
 	// (.../protection/required_signatures), not a field of the

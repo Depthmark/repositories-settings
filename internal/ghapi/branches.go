@@ -31,6 +31,16 @@ func DecodeProtection(p *github.Protection) map[string]any {
 		"allow_force_pushes":               p.AllowForcePushes != nil && p.AllowForcePushes.Enabled,
 		"allow_deletions":                  p.AllowDeletions != nil && p.AllowDeletions.Enabled,
 		"required_conversation_resolution": p.RequiredConversationResolution != nil && p.RequiredConversationResolution.Enabled,
+		"block_creations":                  p.GetBlockCreations().GetEnabled(),
+		"lock_branch":                      p.GetLockBranch().GetEnabled(),
+		"allow_fork_syncing":               p.GetAllowForkSyncing().GetEnabled(),
+
+		// A sub-object GitHub omits is off, which the desired document
+		// states as null. Leaving the key out instead made the differ
+		// report nil -> nil, so the branch was rewritten on every run.
+		"required_status_checks":        nil,
+		"required_pull_request_reviews": nil,
+		"restrictions":                  nil,
 	}
 	if p.RequiredSignatures != nil {
 		out["required_signatures"] = p.GetRequiredSignatures().GetEnabled()
@@ -89,6 +99,9 @@ func EncodeProtection(b config.BranchProtection) *github.ProtectionRequest {
 		AllowForcePushes:               b.AllowForcePushes,
 		AllowDeletions:                 b.AllowDeletions,
 		RequiredConversationResolution: b.RequiredConversationResolution,
+		BlockCreations:                 b.BlockCreations,
+		LockBranch:                     b.LockBranch,
+		AllowForkSyncing:               b.AllowForkSyncing,
 	}
 	if c := b.RequiredStatusChecks; c != nil {
 		contexts := c.Contexts
