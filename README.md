@@ -28,7 +28,7 @@ Triggers:
   without leaving the PR. See [PR commands](#pr-commands) below.
 - **HTTP API** — `POST /api/reconcile` for ad-hoc or selective runs;
   `POST /api/validate` to check a YAML file before committing;
-  `POST /api/check` for the workflow-driven dry-run path.
+  `POST /api/check` to dry-run a commit, such as a pull request head.
 - **Cron worker** — periodic batch reconcile across many repos with
   GraphQL prefetch. The package is implemented and tested, but
   `cmd/repo-settings` does not construct it: nothing schedules a batch
@@ -236,7 +236,7 @@ retried by the next caller. There is no `/api/invalidate-cache` endpoint.
 | --------------------- | ----------------------------------- | --------------------------------------------- |
 | `POST /webhook`       | `X-Hub-Signature-256` (HMAC SHA256) | GitHub event intake (`push`, `pull_request`, `issue_comment`) |
 | `POST /api/reconcile` | Bearer; OIDC applies also require a trusted event and the current default branch | Manual reconcile (`{owner, repo, dry_run, changed_files}`) |
-| `POST /api/check`     | Bearer, repository-scoped under OIDC | Workflow dry-run (`{owner, repo, head_sha, pr_number}`), returns a conclusion |
+| `POST /api/check`     | Bearer, repository-scoped under OIDC | Dry-run a commit (`{owner, repo, head_sha, pr_number}`), returns a conclusion |
 | `POST /api/validate`  | none                                | Validate YAML files (`{files: [{name, content}]}`). `200` when valid, `422` when not. |
 | `GET /healthz`        | none                                | Liveness                                      |
 | `GET /readyz`         | none                                | Readiness (returns 503 during shutdown)       |
@@ -468,86 +468,39 @@ working without the user having to redo their config.
 Unknown keys in `DISABLED_RESOURCES` log a warning at boot rather than
 silently mis-spelling the gate; check the startup logs after edits.
 
-## Driving via GitHub Actions
+## Use it in a repository
 
-[`examples/workflow-pr-check.yml`](examples/workflow-pr-check.yml) shows
-static-token calls from a target repository. Before enabling it, create
-a GitHub environment named `repo-settings` with required reviewers and
-trusted deployment branches. Store `REPO_SETTINGS_URL` and
-`REPO_SETTINGS_TOKEN` as environment secrets; the token must match
-the service's `API_TOKEN`. Keep this operator-wide token out of repository
-or organization secrets available to unreviewed workflow changes.
-Both jobs require that protected environment. Two trigger paths call
-the API:
+A managed repository needs no workflow. The GitHub App does the work
+from its webhooks:
 
-| Trigger             | Calls            | What runs                                                                  |
-| ------------------- | ---------------- | -------------------------------------------------------------------------- |
-| `pull_request`      | `/api/check`     | Dry-run against the PR head; posts the diff/error as a sticky PR comment; fails the check on lane errors. Skipped on fork PRs (secrets aren't injected). |
-| `workflow_dispatch` | `/api/reconcile` | Maintainer chooses `dry-run` or `apply`; the job runs only from the default branch. Apply exits non-zero if any lane failed. |
+1. Install the App on the repository, or on every repository of the
+   organization. See [GitHub App registration](#github-app-registration).
+2. Open a pull request that adds or edits `.github/settings/*.yml`. The
+   App dry-runs the pull request head and posts the planned changes, or
+   the validation errors, as a sticky comment.
+3. Merge it. The push to the default branch applies the configuration.
+   Use the [PR commands](#pr-commands) to refresh the diff or re-apply
+   without a new commit.
 
-HTTP errors fail the sample jobs, and the pull request job accepts only
-the defined `success`, `neutral`, or `failure` conclusions. Its sticky
-comment reads the rendered summary from a file.
-
-Use the maintained reusable workflow below for OIDC authentication,
-which needs no shared service secret:
-
-```yaml
-name: repo-settings
-on:
-  push:
-    branches: [main] # Replace with this repository's default branch.
-    paths: ['.github/settings/**']
-  pull_request:
-    paths: ['.github/settings/**']
-permissions:
-  contents: read
-  pull-requests: write
-  id-token: write
-jobs:
-  settings:
-    uses: Depthmark/repositories-settings/.github/workflows/repo-settings-default.yml@<verified-full-commit-sha>
-    with:
-      api-url: https://repo-settings.example.com
-      oidc-audience: repo-settings
-```
-
-Replace `<verified-full-commit-sha>` with a reviewed commit containing
-both reusable workflow files before committing this example. Set the
-service's `OIDC_AUDIENCE=repo-settings`, or change both audience values
-to the same string.
-
-The wrapper defaults to `auth-mode: oidc`, so the run authenticates with
-its own GitHub identity token. `id-token: write` has to be granted by the
-calling workflow, because a reusable workflow can only narrow the
-permissions it is given; the permission alone confers no repository
-access. The low-level `repo-settings.yml` also defaults to
-`auth-mode: oidc`. Token mode requires `secrets.api-token` matching the
-service's `API_TOKEN`; it also works when the service enables OIDC.
-`auth-mode: sts` is no longer supported.
-
-The reusable workflow checks pull requests from the same repository;
-fork contributions use the App webhook check. Its apply step runs only
-for a non-deleted push to the repository's default branch.
-
-The webhook handler and workflow each post their own sticky comment.
-Choose which integration handles pull request checks to avoid duplicate
-comments. Keep the GitHub App installed: the service needs its
-installation credentials for workflow-driven reads and writes too.
+The [HTTP API](#endpoints) is for operators who script a run, for
+example from a GitHub Actions job that sends its OIDC token (see
+[API authentication](#api-authentication)). Do not add a workflow that
+calls `/api/check` on pull requests: the App already comments there, and
+both would post.
 
 ## Migrating an existing deployment
 
 1. Build with Go 1.26.7 or newer and the digest-pinned images in
    `Dockerfile`. Set `APP_ID`, a valid App private key, and
    `WEBHOOK_SECRET`; leave `ALLOW_UNAUTHENTICATED` unset.
-2. Choose the API credential. For OIDC, set `OIDC_AUDIENCE` to match
-   `oidc-audience`, grant callers `id-token: write`, and replace old STS
-   inputs with `auth-mode: oidc`. Retain `API_TOKEN` only for clients
+2. Choose the API credential for operator scripts. For OIDC, set
+   `OIDC_AUDIENCE` and have callers request their token for that
+   audience with `id-token: write`. Retain `API_TOKEN` only for clients
    that still require a static operator credential.
-3. Restrict workflow apply triggers to the repository's default branch.
-   Use `/api/check` for pull request heads. Update consumers to handle
-   validation HTTP `422`, authorization HTTP `401`/`403`, and failure
-   fields in HTTP `200` reconcile reports.
+3. Remove any repo-settings workflow from managed repositories: the App
+   dry-runs pull requests and applies merges. Update API scripts to
+   handle validation HTTP `422`, authorization HTTP `401`/`403`, and
+   failure fields in HTTP `200` reconcile reports.
 4. If org policy is required, set a valid `ORG_ADMIN_REPO`, install the
    App there, and confirm it contains the intended `policy.yml` and
    defaults. Allow five minutes for cached admin changes to expire;
@@ -618,10 +571,10 @@ TypeScript parity harness.
   present. Set `ORG_ADMIN_REPO` to turn them on; see
   [Org layering and policy](#org-layering-and-policy). With it unset, a
   repository's own configuration stands alone and no policy applies.
-- **Workflows authenticate with their own GitHub identity.** The
-  reusable workflow's `auth-mode: oidc` sends the short-lived token
-  GitHub mints for the run, which names the repository it runs in, so
-  the service refuses a request for any other. See
+- **API callers in Actions authenticate with their own GitHub
+  identity.** A job sends the short-lived OIDC token GitHub mints for
+  the run, which names the repository it runs in, so the service
+  refuses a request for any other. See
   [API authentication](#api-authentication).
 - **The cron worker is not scheduled.** `internal/worker` is implemented
   and tested but `cmd/repo-settings/main.go` never constructs it.
