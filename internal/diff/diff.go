@@ -183,7 +183,7 @@ func ToMap(v any) (map[string]any, error) {
 		return nil, nil
 	}
 	rv := reflect.ValueOf(v)
-	if rv.Kind() == reflect.Ptr && rv.IsNil() {
+	if rv.Kind() == reflect.Pointer && rv.IsNil() {
 		return nil, nil
 	}
 	b, err := json.Marshal(v)
