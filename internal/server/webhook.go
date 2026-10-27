@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/Depthmark/repositories-settings/internal/config"
+	"github.com/Depthmark/repositories-settings/internal/ghclient"
 	"github.com/Depthmark/repositories-settings/internal/metrics"
 	"github.com/Depthmark/repositories-settings/internal/reconciler"
 )
@@ -49,9 +50,8 @@ type genericPayload struct {
 		} `json:"pull_request,omitempty"`
 	} `json:"issue"`
 	Comment struct {
-		Body              string `json:"body"`
-		AuthorAssociation string `json:"author_association"`
-		User              struct {
+		Body string `json:"body"`
+		User struct {
 			Login string `json:"login"`
 			Type  string `json:"type"`
 		} `json:"user"`
@@ -190,18 +190,21 @@ func (h *webhookHandler) handleIssueComment(w http.ResponseWriter, ctx context.C
 		_, _ = upsertStickyComment(ctx, h.deps.Client, repo, p.Issue.Number, HelpMarkdown(h.deps.AppSlug))
 		writeJSON(w, http.StatusOK, map[string]any{"received": true, "command": "help"})
 	case CmdRecheck:
-		// Reuse the dry-run flow against the PR head. We don't have the
-		// SHA on issue_comment, so the loader reads the latest from the
-		// PR's branch via the API in Settings(); passing "" defers to it.
-		h.runDryRunAndComment(w, ctx, repo, p.Issue.Number, "")
-	case CmdApply:
-		if !IsPrivilegedAuthor(p.Comment.AuthorAssociation) {
-			body := fmt.Sprintf(":lock: `apply` requires write access; @%s has association `%s`.",
-				p.Comment.User.Login, strings.ToLower(p.Comment.AuthorAssociation))
-			_, _ = upsertStickyComment(ctx, h.deps.Client, repo, p.Issue.Number, body)
-			writeJSON(w, http.StatusOK, map[string]any{"received": true, "rejected": "unprivileged"})
+		// issue_comment carries no head SHA, and an empty ref loads the
+		// default branch, which would replace the PR's plan with main's.
+		sha, err := h.deps.Client.PullRequestHeadSHA(ctx, repo, p.Issue.Number)
+		if err != nil {
+			h.commentError(ctx, repo, p.Issue.Number, "loading the pull request", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		h.runDryRunAndComment(w, ctx, repo, p.Issue.Number, sha)
+	case CmdApply:
+		if !h.authorizeApply(w, ctx, repo, p.Issue.Number, p.Comment.User.Login) {
+			return
+		}
+		// apply applies the default branch, never the PR head: applying
+		// unmerged settings would bypass review.
 		res, err := h.deps.Settings(ctx, repo, "")
 		if err != nil {
 			h.commentError(ctx, repo, p.Issue.Number, "loading config", err)
@@ -217,6 +220,35 @@ func (h *webhookHandler) handleIssueComment(w http.ResponseWriter, ctx context.C
 		_, _ = upsertStickyComment(ctx, h.deps.Client, repo, p.Issue.Number, formatApplyReport(rep))
 		writeJSON(w, http.StatusOK, rep)
 	}
+}
+
+// authorizeApply asks GitHub for the commenter's permission on the
+// repository and refuses apply below write. The payload's
+// author_association is not enough: MEMBER and COLLABORATOR include
+// read-only users. A failed lookup refuses too, so an outage never
+// widens who can apply. It writes the response when it refuses.
+func (h *webhookHandler) authorizeApply(w http.ResponseWriter, ctx context.Context, repo config.Repo, prNumber int, login string) bool {
+	perm, err := h.deps.Client.CollaboratorPermission(ctx, repo, login)
+	if err != nil {
+		h.deps.Logger.Warn("apply refused: permission lookup failed",
+			"repo", repo.String(), "pr", prNumber, "user", login,
+			"status", ghclient.StatusCode(err), "err", err)
+		body := fmt.Sprintf(":lock: `apply` refused: the permission of @%s on this repository could not be checked.", login)
+		_, _ = upsertStickyComment(ctx, h.deps.Client, repo, prNumber, body)
+		http.Error(w, "permission lookup failed", http.StatusInternalServerError)
+		return false
+	}
+	if !CanApply(perm) {
+		role := perm.RoleName
+		if role == "" {
+			role = perm.Permission
+		}
+		body := fmt.Sprintf(":lock: `apply` requires write, maintain or admin permission; @%s has `%s`.", login, role)
+		_, _ = upsertStickyComment(ctx, h.deps.Client, repo, prNumber, body)
+		writeJSON(w, http.StatusOK, map[string]any{"received": true, "rejected": "insufficient permission", "permission": role})
+		return false
+	}
+	return true
 }
 
 // runDryRunAndComment loads settings at headSHA, runs a dry-run, and

@@ -275,6 +275,20 @@ func IsNotFound(err error) bool {
 	return errors.As(err, &ae) && ae.Status == http.StatusNotFound
 }
 
+// StatusCode returns the HTTP status of a failed GitHub call, from the
+// raw client or the SDK, or 0 when the call never got a response.
+func StatusCode(err error) int {
+	var ae *APIError
+	if errors.As(err, &ae) {
+		return ae.Status
+	}
+	var ge *github.ErrorResponse
+	if errors.As(err, &ge) && ge.Response != nil {
+		return ge.Response.StatusCode
+	}
+	return 0
+}
+
 // CheckRepository verifies access before loading optional admin files.
 func (c *Client) CheckRepository(ctx context.Context, repo config.Repo) error {
 	ctx = WithCall(ctx, PriorityCronReconcile, repo.Owner, ghapi.RouteRepo)

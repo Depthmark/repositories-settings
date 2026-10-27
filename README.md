@@ -342,8 +342,8 @@ the [manifest handshake](https://docs.github.com/en/apps/sharing-github-apps/reg
 | `repository_hooks: write`           | repo  | repository webhooks (`/repos/:o/:r/hooks`)                                                              |
 | `repository_custom_properties: write` | repo  | reading and writing custom-property values on repos                                                     |
 | `contents: read`                    | repo  | reading `.github/settings/*.yml` from the default branch and PR head                                    |
-| `metadata: read`                    | repo  | mandatory for any App installation; also required by GraphQL prefetch                                   |
-| `pull_requests: write`              | repo  | the sticky dry-run comment on `pull_request.opened`/`synchronize` and the reply to a PR command          |
+| `metadata: read`                    | repo  | mandatory for any App installation; also required by GraphQL prefetch and the commenter's permission lookup for `apply` |
+| `pull_requests: write`              | repo  | the sticky dry-run comment on `pull_request.opened`/`synchronize`, the reply to a PR command, and the PR head lookup for `recheck` |
 | `issues: read`                      | repo  | dependency of `pull_requests` permission family in GitHub's model                                       |
 | `members: write`                    | org   | `PUT/DELETE /orgs/:org/teams/:slug/repos/...` to bind/unbind teams                                      |
 | `organization_administration: read` | org   | resolving installation-by-owner via `/orgs/:org/installation`                                           |
@@ -381,9 +381,9 @@ of a comment line, optionally followed by a verb:
 
 | Comment                       | Effect                                                              |
 | ----------------------------- | ------------------------------------------------------------------- |
-| `@repo-settings recheck`      | Dry-run the current default-branch configuration and refresh the sticky diff comment. |
+| `@repo-settings recheck`      | Dry-run the pull request's head and refresh the sticky diff comment. |
 | `@repo-settings diff`         | Alias of `recheck`.                                                 |
-| `@repo-settings apply`        | Apply the current default-branch configuration. The signed webhook must report `OWNER`, `MEMBER`, or `COLLABORATOR`; other associations are refused. |
+| `@repo-settings apply`        | Apply the default branch's configuration now, not the pull request's: unmerged settings never skip review. The service asks GitHub for the commenter's permission on the repository; `write`, `maintain` and `admin` apply, while `read`, `triage` and a failed lookup are refused. |
 | `@repo-settings help`         | Post the command list. Also fires when a known slug appears on a line with no verb. |
 | `/repo-settings <verb>`       | Slash variant — same set of verbs.                                  |
 
