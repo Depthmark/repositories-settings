@@ -415,7 +415,10 @@ Two things it is worth knowing before reading anything else:
 - A declared **collection** is authoritative: a webhook, autolink, deploy key,
   variable, team binding, collaborator, environment or ruleset that
   exists on GitHub but is absent from your YAML is deleted. So is any
-  branch-protection sub-setting you omit from a branch you do list.
+  branch-protection sub-setting you omit from a branch you do list,
+  including `lock_branch`, `block_creations` and `allow_fork_syncing`:
+  a branch locked in the GitHub UI is unlocked by the next apply unless
+  `branches.yml` sets `lock_branch: true`, and the dry run shows it.
   An undeclared collection remains unmanaged.
 
 ## Disabling resources

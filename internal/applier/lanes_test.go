@@ -819,3 +819,137 @@ func TestBranchesLane_DryRunNoWrites(t *testing.T) {
 		t.Fatalf("dry-run hit %d write endpoints", writes)
 	}
 }
+
+// A branch locked in the GitHub UI and configured without lock_branch is
+// unlocked by the next PUT, because GitHub reads an omitted lock_branch
+// as false. The dry run has to report that rather than stay silent.
+func TestBranchesLane_DryRunReportsLockBranchReset(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/branches/main/protection" {
+			_, _ = w.Write([]byte(`{"enforce_admins":{"enabled":true},"lock_branch":{"enabled":true}}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	cl, rl := newTestClient(srv)
+	defer rl.Stop()
+
+	s := &config.Settings{Branches: &config.BranchesConfig{Branches: []config.BranchProtection{
+		{Pattern: "main", EnforceAdmins: config.Ptr(true)},
+	}}}
+	s.Normalize()
+	diffs, _, err := NewBranchesLane(s.Branches).Run(context.Background(), cl, config.Repo{Owner: "o", Name: "r"}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := firstActionable(t, diffs)
+	if len(d.Changes) != 1 || d.Changes[0].Path != "lock_branch" ||
+		d.Changes[0].From != true || d.Changes[0].To != false {
+		t.Fatalf("expected only lock_branch true -> false, got %+v", d.Changes)
+	}
+}
+
+// Setting all three puts them in the PUT body, and once GitHub holds
+// them the next dry run finds nothing to change.
+func TestBranchesLane_AppliesLockAndCreationFields(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		live   []byte // GET body; nil while the branch is unprotected
+		putted map[string]any
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.Method == http.MethodGet && live == nil:
+			http.Error(w, `{"message":"Not Found"}`, http.StatusNotFound)
+		case r.Method == http.MethodGet:
+			_, _ = w.Write(live)
+		case r.Method == http.MethodPut && r.URL.Path == "/repos/o/r/branches/main/protection":
+			if err := json.NewDecoder(r.Body).Decode(&putted); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			live = protectionFromPut(t, putted)
+			_, _ = w.Write(live)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	cl, rl := newTestClient(srv)
+	defer rl.Stop()
+
+	s := &config.Settings{Branches: &config.BranchesConfig{Branches: []config.BranchProtection{{
+		Pattern:          "main",
+		Restrictions:     &config.BranchRestrictions{Users: []string{"alice"}},
+		BlockCreations:   config.Ptr(true),
+		LockBranch:       config.Ptr(true),
+		AllowForkSyncing: config.Ptr(true),
+	}}}}
+	s.Normalize()
+	lane := NewBranchesLane(s.Branches)
+	repo := config.Repo{Owner: "o", Name: "r"}
+
+	_, results, err := lane.Run(context.Background(), cl, repo, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if countSuccess(results) != 1 {
+		t.Fatalf("expected one successful apply, got %+v", results)
+	}
+	for _, k := range []string{"block_creations", "lock_branch", "allow_fork_syncing"} {
+		if putted[k] != true {
+			t.Errorf("PUT body %s = %v, want true", k, putted[k])
+		}
+	}
+
+	diffs, _, err := lane.Run(context.Background(), cl, repo, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range diffs {
+		if d.Action != diff.Noop {
+			t.Errorf("second dry run should be a noop, got %s %+v", d.Action, d.Changes)
+		}
+	}
+}
+
+// protectionFromPut renders a PUT .../protection body the way GET
+// returns it: booleans wrapped as {"enabled": v}, actors as objects.
+func protectionFromPut(t *testing.T, body map[string]any) []byte {
+	t.Helper()
+	objects := func(v any, key string) []any {
+		out := []any{}
+		names, _ := v.([]any)
+		for _, n := range names {
+			out = append(out, map[string]any{key: n})
+		}
+		return out
+	}
+	out := map[string]any{}
+	for k, v := range body {
+		switch k {
+		case "required_status_checks", "required_pull_request_reviews":
+			if v != nil {
+				out[k] = v
+			}
+		case "restrictions":
+			if r, ok := v.(map[string]any); ok {
+				out[k] = map[string]any{
+					"users": objects(r["users"], "login"),
+					"teams": objects(r["teams"], "slug"),
+					"apps":  objects(r["apps"], "slug"),
+				}
+			}
+		default:
+			out[k] = map[string]any{"enabled": v}
+		}
+	}
+	raw, err := json.Marshal(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}

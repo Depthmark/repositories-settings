@@ -27,6 +27,9 @@ func TestBranchesLane_MatchingConfigIsNoop(t *testing.T) {
 	  "allow_force_pushes": {"enabled": false},
 	  "allow_deletions": {"enabled": false},
 	  "required_conversation_resolution": {"enabled": true},
+	  "block_creations": {"enabled": true},
+	  "lock_branch": {"enabled": true},
+	  "allow_fork_syncing": {"enabled": false},
 	  "required_signatures": {"url":"u","enabled": false}
 	}`
 	var raw github.Protection
@@ -40,6 +43,8 @@ func TestBranchesLane_MatchingConfigIsNoop(t *testing.T) {
 		EnforceAdmins:                  config.Ptr(true),
 		RequiredLinearHistory:          config.Ptr(true),
 		RequiredConversationResolution: config.Ptr(true),
+		BlockCreations:                 config.Ptr(true),
+		LockBranch:                     config.Ptr(true),
 		RequiredPullRequestReviews: &config.RequiredPRReviews{
 			RequiredApprovingReviewCount: config.Ptr(2),
 			DismissStaleReviews:          config.Ptr(true),
@@ -74,8 +79,15 @@ func TestNormalize_CompletesBranchProtectionRecord(t *testing.T) {
 	}}}}
 	s.Normalize()
 	b := s.Branches.Branches[0]
-	if b.EnforceAdmins == nil || *b.EnforceAdmins {
-		t.Errorf("enforce_admins should default to an explicit false, got %v", b.EnforceAdmins)
+	for name, f := range map[string]*bool{
+		"enforce_admins":     b.EnforceAdmins,
+		"block_creations":    b.BlockCreations,
+		"lock_branch":        b.LockBranch,
+		"allow_fork_syncing": b.AllowForkSyncing,
+	} {
+		if f == nil || *f {
+			t.Errorf("%s should default to an explicit false, got %v", name, f)
+		}
 	}
 	if b.RequiredStatusChecks.Strict == nil {
 		t.Error("strict should be filled in once required_status_checks is configured")

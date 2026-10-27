@@ -126,3 +126,26 @@ func asValidationError(err error, target **ValidationError) bool {
 	}
 	return false
 }
+
+// The three protection fields GitHub resets when a PUT omits them load
+// as booleans, and a value that is not one is refused with its line.
+func TestLoadFromMap_BranchLockAndCreationFields(t *testing.T) {
+	s, err := LoadFromMap(map[string][]byte{
+		"branches.yml": []byte("_version: 1\nbranches:\n  - pattern: main\n    lock_branch: true\n    block_creations: false\n    allow_fork_syncing: true\n"),
+	})
+	if err != nil {
+		t.Fatalf("booleans must load: %v", err)
+	}
+	b := s.Branches.Branches[0]
+	if !*b.LockBranch || *b.BlockCreations || !*b.AllowForkSyncing {
+		t.Errorf("got lock_branch=%v block_creations=%v allow_fork_syncing=%v",
+			*b.LockBranch, *b.BlockCreations, *b.AllowForkSyncing)
+	}
+
+	_, err = LoadFromMap(map[string][]byte{
+		"branches.yml": []byte("_version: 1\nbranches:\n  - pattern: main\n    lock_branch: \"maybe\"\n"),
+	})
+	if err == nil || !strings.Contains(err.Error(), "line 4") {
+		t.Fatalf("a non-boolean must be refused with its line, got: %v", err)
+	}
+}

@@ -62,6 +62,9 @@ func (b *BranchProtection) normalize() {
 		&b.AllowForcePushes,
 		&b.AllowDeletions,
 		&b.RequiredConversationResolution,
+		&b.BlockCreations,
+		&b.LockBranch,
+		&b.AllowForkSyncing,
 	} {
 		if *f == nil {
 			*f = Ptr(false)
