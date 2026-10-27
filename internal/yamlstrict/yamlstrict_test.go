@@ -2,6 +2,7 @@ package yamlstrict
 
 import (
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -87,3 +88,119 @@ func TestIssues_NilErrorHasNoIssues(t *testing.T) {
 		t.Fatalf("expected nil, got %#v", got)
 	}
 }
+
+type flags struct {
+	Enabled *bool          `yaml:"enabled"`
+	Plain   bool           `yaml:"plain"`
+	List    []bool         `yaml:"list"`
+	Free    any            `yaml:"free"`
+	Params  map[string]any `yaml:"params"`
+}
+
+// yaml.v3 decodes yes, on and their opposites into a Go bool, quoted
+// or not, and refuses "true" and 1 by line only. Each is refused here,
+// with the field named.
+func TestDecode_RefusesNonBooleans(t *testing.T) {
+	for _, value := range []string{"yes", "on", "Y", "off", `"yes"`, `"true"`, "1", "maybe", "[true]", "{a: 1}"} {
+		for _, field := range []string{"enabled", "plain"} {
+			t.Run(field+"="+value, func(t *testing.T) {
+				var f flags
+				err := Decode([]byte(field+": "+value+"\n"), &f)
+				want := "line 1: " + field + ": must be true or false"
+				if got := Issues(err); len(got) != 1 || got[0] != want {
+					t.Fatalf("Issues = %#v, want [%q]", got, want)
+				}
+			})
+		}
+	}
+}
+
+// The YAML 1.2 core schema: what yaml.v3 tags !!bool loads. A null
+// leaves the field unset, as for every other field.
+func TestDecode_AcceptsYAMLBooleans(t *testing.T) {
+	cases := map[string]*bool{
+		"true": ptr(true), "True": ptr(true), "TRUE": ptr(true),
+		"false": ptr(false), "False": ptr(false), "FALSE": ptr(false),
+		"null": nil, "": nil,
+	}
+	for value, want := range cases {
+		var f flags
+		if err := Decode([]byte("enabled: "+value+"\n"), &f); err != nil {
+			t.Fatalf("enabled: %s: %v", value, err)
+		}
+		if (f.Enabled == nil) != (want == nil) || (want != nil && *f.Enabled != *want) {
+			t.Errorf("enabled: %s loaded as %v, want %v", value, f.Enabled, want)
+		}
+	}
+}
+
+// Free-form values have no Go bool to bend them: yes stays the string
+// the operator wrote.
+func TestDecode_FreeFormValuesKeepYes(t *testing.T) {
+	var f flags
+	if err := Decode([]byte("free: yes\nparams:\n  push: yes\n"), &f); err != nil {
+		t.Fatal(err)
+	}
+	if f.Free != "yes" || f.Params["push"] != "yes" {
+		t.Fatalf("free = %#v, params = %#v, want the string \"yes\"", f.Free, f.Params)
+	}
+}
+
+// Every problem in the file at once, in line order: wrong booleans and
+// unknown fields alike, one issue each.
+func TestIssues_OneIssuePerWrongBooleanAmongUnknownFields(t *testing.T) {
+	var d doc
+	err := Decode([]byte("_version: 1\nnested:\n  enabled: yes\nnam: x\n"), &d)
+	got := Issues(err)
+	if len(got) != 2 || got[0] != "line 3: nested.enabled: must be true or false" || !strings.Contains(got[1], `line 4: unknown field "nam"`) {
+		t.Fatalf("Issues = %#v", got)
+	}
+
+	var f flags
+	err = Decode([]byte("enabled: yes\nplain: maybe\nlist: [true, on, 1]\n"), &f)
+	want := []string{
+		"line 1: enabled: must be true or false",
+		"line 2: plain: must be true or false",
+		"line 3: list[1]: must be true or false",
+		"line 3: list[2]: must be true or false",
+	}
+	if got := Issues(err); !slices.Equal(got, want) {
+		t.Fatalf("Issues = %#v, want %#v", got, want)
+	}
+}
+
+// An anchor written in a free-form field is still checked where an
+// alias puts it in a bool field, once however often it is used.
+func TestDecode_FollowsAliasesAndMergeKeys(t *testing.T) {
+	var f flags
+	err := Decode([]byte("free: &a yes\nlist: [*a, *a, *a]\n"), &f)
+	if got := Issues(err); len(got) != 1 || got[0] != "line 1: list[0]: must be true or false" {
+		t.Fatalf("alias: Issues = %#v", got)
+	}
+
+	var d doc
+	err = Decode([]byte("_version: 1\nnested:\n  <<: {enabled: on}\n"), &d)
+	if got := Issues(err); len(got) != 1 || got[0] != "line 3: nested.enabled: must be true or false" {
+		t.Fatalf("merge key: Issues = %#v", got)
+	}
+}
+
+// yaml.v3 stops on an explicit tag it cannot honour, without a line;
+// the field is still named first.
+func TestDecode_ExplicitBoolTagStillNamesTheField(t *testing.T) {
+	var f flags
+	got := Issues(Decode([]byte("enabled: !!bool yes\n"), &f))
+	if len(got) != 2 || got[0] != "line 1: enabled: must be true or false" || !strings.Contains(got[1], "cannot decode") {
+		t.Fatalf("Issues = %#v", got)
+	}
+}
+
+// An anchor inside itself must not make the walk loop.
+func TestDecode_SelfReferencingAnchorEnds(t *testing.T) {
+	var f flags
+	if err := Decode([]byte("list: &a [*a]\n"), &f); err == nil {
+		t.Fatal("expected an error")
+	}
+}
+
+func ptr[T any](v T) *T { return &v }
